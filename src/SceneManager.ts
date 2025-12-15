@@ -19,6 +19,8 @@ export class SceneManager {
       alpha: false,
       powerPreference: 'high-performance'
     });
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.renderer.toneMapping = THREE.NoToneMapping;
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     // Update the canvas drawingbuffer size to match CSS pixels.
     // (Leaving this false can result in a stretched / mismatched render target.)
@@ -30,6 +32,14 @@ export class SceneManager {
     this.camera.lookAt(new THREE.Vector3(0, 0, 0));
 
     window.addEventListener('resize', this.handleResize);
+  }
+
+  getRendererInfo() {
+    return {
+      pixelRatio: this.renderer.getPixelRatio(),
+      outputColorSpace: this.renderer.outputColorSpace,
+      toneMapping: this.renderer.toneMapping
+    };
   }
 
   async addLayer(layer: Layer) {

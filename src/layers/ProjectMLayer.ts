@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { Layer } from './Layer';
 import { ProjectMEngine } from '../projectm/ProjectMEngine';
+import type { AudioFrame } from '../types/audioFrame';
 
 interface ProjectMLayerOptions {
   opacity?: number;
@@ -14,6 +15,11 @@ export class ProjectMLayer implements Layer {
   private texture: THREE.CanvasTexture | null = null;
   private rendererRef: THREE.WebGLRenderer | null = null;
   private pixelRatio = 1;
+  private currentEnergy = 0;
+  private baseOpacity = 0.85;
+  private energyToOpacityAmount = 0.2;
+  private audioDrivenOpacity = true;
+  private blendMode: 'normal' | 'add' | 'screen' | 'multiply' = 'add';
 
   private readonly options: Required<ProjectMLayerOptions>;
 
@@ -22,6 +28,7 @@ export class ProjectMLayer implements Layer {
       opacity: options.opacity ?? 0.85,
       presetUrl: options.presetUrl ?? '/presets/default.milk'
     };
+    this.baseOpacity = this.options.opacity;
   }
 
   async init(scene: THREE.Scene, renderer: THREE.WebGLRenderer) {
@@ -57,10 +64,12 @@ export class ProjectMLayer implements Layer {
       map: this.texture,
       transparent: true,
       opacity: this.options.opacity,
-      blending: THREE.AdditiveBlending,
+      blending: THREE.NormalBlending,
       depthTest: false,
       depthWrite: false
     });
+
+    this.applyBlendMode(this.blendMode);
 
     const geometry = new THREE.PlaneGeometry(2, 2);
     this.mesh = new THREE.Mesh(geometry, this.material);
@@ -69,10 +78,50 @@ export class ProjectMLayer implements Layer {
     scene.add(this.mesh);
   }
 
+  setAudioFrame(frame: AudioFrame) {
+    this.currentEnergy = frame.energy;
+    this.engine?.addAudioData(frame.pcm2048Mono);
+  }
+
+  setBlendParams(params: {
+    opacity?: number;
+    blendMode?: 'normal' | 'add' | 'screen' | 'multiply';
+    audioDrivenOpacity?: boolean;
+    energyToOpacityAmount?: number;
+  }) {
+    if (typeof params.opacity === 'number') {
+      this.baseOpacity = params.opacity;
+    }
+    if (typeof params.audioDrivenOpacity === 'boolean') {
+      this.audioDrivenOpacity = params.audioDrivenOpacity;
+    }
+    if (typeof params.energyToOpacityAmount === 'number') {
+      this.energyToOpacityAmount = params.energyToOpacityAmount;
+    }
+    if (params.blendMode) {
+      this.blendMode = params.blendMode;
+      this.applyBlendMode(params.blendMode);
+    }
+  }
+
+  getBlendParams() {
+    return {
+      opacity: this.baseOpacity,
+      blendMode: this.blendMode,
+      audioDrivenOpacity: this.audioDrivenOpacity,
+      energyToOpacityAmount: this.energyToOpacityAmount,
+    };
+  }
+
   update(_deltaTime: number) {
     if (!this.engine || !this.texture) return;
     this.engine.render();
     this.texture.needsUpdate = true;
+    if (this.material) {
+      const driven = this.audioDrivenOpacity ? this.currentEnergy * this.energyToOpacityAmount : 0;
+      const targetOpacity = Math.min(1, Math.max(0, this.baseOpacity + driven));
+      this.material.opacity = targetOpacity;
+    }
   }
 
   isReady() {
@@ -88,6 +137,7 @@ export class ProjectMLayer implements Layer {
 
   setOpacity(value: number) {
     this.options.opacity = value;
+    this.baseOpacity = value;
     if (this.material) {
       this.material.opacity = value;
     }
@@ -198,5 +248,44 @@ export class ProjectMLayer implements Layer {
     }
     this.engine?.dispose();
     this.engine = null;
+  }
+
+  private applyBlendMode(mode: 'normal' | 'add' | 'screen' | 'multiply') {
+    if (!this.material) return;
+
+    // Reset to defaults to avoid carrying stale CustomBlending factors.
+    this.material.blendEquation = THREE.AddEquation;
+    this.material.blendSrc = THREE.SrcAlphaFactor;
+    this.material.blendDst = THREE.OneMinusSrcAlphaFactor;
+    this.material.blendEquationAlpha = THREE.AddEquation;
+    this.material.blendSrcAlpha = THREE.OneFactor;
+    this.material.blendDstAlpha = THREE.OneMinusSrcAlphaFactor;
+
+    switch (mode) {
+      case 'normal':
+        this.material.blending = THREE.NormalBlending;
+        break;
+      case 'multiply':
+        this.material.blending = THREE.MultiplyBlending;
+        break;
+      case 'add':
+        this.material.blending = THREE.AdditiveBlending;
+        break;
+      case 'screen':
+      default:
+        // Screen: src + dst*(1-src). Approximated via fixed-function blend:
+        // glBlendFunc(ONE, ONE_MINUS_SRC_COLOR)
+        this.material.blending = THREE.CustomBlending;
+        this.material.blendSrc = THREE.OneFactor;
+        this.material.blendDst = THREE.OneMinusSrcColorFactor;
+        this.material.blendEquation = THREE.AddEquation;
+        // Keep alpha compositing reasonable.
+        this.material.blendSrcAlpha = THREE.OneFactor;
+        this.material.blendDstAlpha = THREE.OneMinusSrcAlphaFactor;
+        this.material.blendEquationAlpha = THREE.AddEquation;
+        break;
+    }
+
+    this.material.needsUpdate = true;
   }
 }

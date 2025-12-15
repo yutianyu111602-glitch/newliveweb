@@ -1,9 +1,11 @@
-import './style.css';
+﻿import './style.css';
 import { SceneManager } from './SceneManager';
 import { LiquidMetalLayerV2 } from './layers/LiquidMetalLayerV2';
 import { LiquidMetalControlPanel } from './ui/LiquidMetalControlPanel';
 import { ProjectMLayer } from './layers/ProjectMLayer';
-import { AudioController } from './audio/AudioController';
+import { AudioBus } from './audio/AudioBus';
+import type { AudioFrame } from './types/audioFrame';
+import { DiagnosticsPanel } from './features/console/DiagnosticsPanel';
 import {
   type PresetDescriptor,
   BUILT_IN_PRESETS,
@@ -25,6 +27,18 @@ import {
 import { CAMERA_FEATURE } from './config/cameraSources';
 import { CameraLayer } from './layers/CameraLayer';
 
+import {
+  type BlendMode,
+  type FavoriteVisualState,
+  type VisualStateV1,
+  cloneVisualState,
+  createDefaultVisualState,
+  loadFavoritesFromStorage,
+  saveFavoritesToStorage
+} from './features/visualState/visualStateStore';
+import { randomizeBlendParams, randomizeLiquidMetalParams } from './state/paramSchema';
+import { createRandomSeed, createSeededRng } from './state/seededRng';
+import { renderShell } from './app/renderShell';
 const app = document.querySelector<HTMLDivElement>('#app');
 if (!app) {
   throw new Error('#app container not found');
@@ -47,116 +61,44 @@ function toLocalAudioUrl(fsPath: string) {
 const TEST_TRACK_URL = toLocalAudioUrl(TEST_TRACK_FS_PATH);
 const presetUrlPlaceholder = `${PRESET_PACK_PATH}/classic/Geiss - Starfish 1.milk`;
 
-app.innerHTML = `
-  <div id="root" class="app-root">
-    <div id="toolbar" class="toolbar">
-      <div class="toolbar__grid">
-        <div class="toolbar__section">
-          <div class="toolbar__section-header">
-            <span class="toolbar__title">newliveweb - LiquidMetal + ProjectM</span>
-            <span id="audio-status" class="toolbar__status toolbar__status--tight">No audio loaded</span>
-          </div>
-          <div class="toolbar__row">
-            <button id="audio-toggle" class="toolbar__button" disabled>Play</button>
-            <label class="toolbar__file">
-              <input type="file" id="audio-file" accept="audio/*" hidden />
-              <span>Load audio</span>
-            </label>
-            <div class="toolbar__url">
-              <input type="text" id="audio-url" placeholder="${audioUrlPlaceholder}" />
-              <button id="audio-url-load" class="toolbar__button toolbar__button--compact">Load URL</button>
-            </div>
-            <label class="toolbar__volume">
-              Vol
-              <input type="range" id="audio-volume" min="0" max="1" step="0.01" value="0.8" />
-            </label>
-            <span id="audio-time" class="toolbar__time">00:00 / 00:00</span>
-          </div>
-        </div>
+const dom = renderShell(app, {
+  librarySelectOptionsHtml: renderLibrarySelectOptions(),
+  audioUrlPlaceholder,
+  presetUrlPlaceholder,
+  testAudioLibraryPathLabel: TEST_AUDIO_LIBRARY_PATH,
+  presetPackPathLabel: PRESET_PACK_PATH,
+});
 
-        <div class="toolbar__section">
-          <div class="toolbar__section-header">
-            <span class="toolbar__subtitle">Preset</span>
-            <span id="preset-status" class="toolbar__status toolbar__status--inline">Preset engine booting...</span>
-          </div>
-          <div class="toolbar__row">
-            <select id="preset-select" class="toolbar__select"></select>
-            <label class="toolbar__file">
-              <input type="file" id="preset-file" accept=".milk" hidden />
-              <span>Import .milk</span>
-            </label>
-            <div class="toolbar__url">
-              <input type="text" id="preset-url" placeholder="${presetUrlPlaceholder}" />
-              <button id="preset-url-load" class="toolbar__button toolbar__button--compact">Load URL</button>
-            </div>
-            <button id="preset-next" class="toolbar__button toolbar__button--compact" title="Load next preset" disabled>Next</button>
-          </div>
-          <div class="toolbar__row">
-            <label class="toolbar__switch" title="自动轮播 ProjectM 预设">
-              <input type="checkbox" id="preset-auto-toggle" />
-              <span id="preset-auto-label">Auto-cycle</span>
-            </label>
-            <label class="toolbar__interval" title="自动轮播间隔（秒）">
-              Every
-              <input type="number" id="preset-auto-interval" min="15" max="600" step="5" value="90" />
-              s
-            </label>
-            <label class="toolbar__hint toolbar__hint--select">
-              <span>库模式</span>
-              <select id="preset-library-select" class="toolbar__select toolbar__select--compact">
-                ${renderLibrarySelectOptions()}
-              </select>
-            </label>
-            <span id="preset-manifest-info" class="toolbar__hint toolbar__hint--status">Preset manifest pending...</span>
-          </div>
-        </div>
-
-        <div class="toolbar__section">
-          <div class="toolbar__section-header">
-            <span class="toolbar__subtitle">Visual actions</span>
-            <span id="visual-favorite-count" class="toolbar__hint toolbar__hint--status toolbar__hint--pill">Favorites: 0</span>
-          </div>
-          <div class="toolbar__row">
-            <button id="visual-random" class="toolbar__button toolbar__button--compact" title="全局随机视觉（受当前音乐能量影响）">Random visual</button>
-            <button id="visual-favorite" class="toolbar__button toolbar__button--compact" title="收藏当前视觉配置">★ Favorite</button>
-            <span class="toolbar__hint toolbar__hint--pill">测试音乐库：${TEST_AUDIO_LIBRARY_PATH}</span>
-            <span class="toolbar__hint toolbar__hint--pill">预设合集：${PRESET_PACK_PATH}</span>
-          </div>
-        </div>
-      </div>
-    </div>
-    <div id="canvas-root" class="canvas-root">
-      <canvas id="viz-canvas"></canvas>
-    </div>
-  </div>
-`;
-
-const canvas = document.querySelector<HTMLCanvasElement>('#viz-canvas');
-if (!canvas) {
-  throw new Error('#viz-canvas not found');
-}
+const canvas = dom.canvas;
 
 const sceneManager = new SceneManager(canvas);
 const liquidLayer = new LiquidMetalLayerV2();
 const liquidControlPanel = new LiquidMetalControlPanel(liquidLayer);
 const projectLayer = new ProjectMLayer();
 const cameraLayer = CAMERA_FEATURE.enabled ? new CameraLayer(CAMERA_FEATURE) : null;
-const audioController = new AudioController();
+const audioBus = new AudioBus();
+const diagnosticsPanel = new DiagnosticsPanel(document.body);
+diagnosticsPanel.updateRenderer(sceneManager.getRendererInfo());
+window.addEventListener('resize', () => diagnosticsPanel.updateRenderer(sceneManager.getRendererInfo()));
 
-const presetSelect = document.querySelector<HTMLSelectElement>('#preset-select');
-const presetFileInput = document.querySelector<HTMLInputElement>('#preset-file');
-const presetUrlInput = document.querySelector<HTMLInputElement>('#preset-url');
-const presetUrlButton = document.querySelector<HTMLButtonElement>('#preset-url-load');
-const presetStatus = document.querySelector<HTMLSpanElement>('#preset-status');
-const presetManifestInfo = document.querySelector<HTMLSpanElement>('#preset-manifest-info');
-const presetNextButton = document.querySelector<HTMLButtonElement>('#preset-next');
-const presetAutoToggle = document.querySelector<HTMLInputElement>('#preset-auto-toggle');
-const presetAutoIntervalInput = document.querySelector<HTMLInputElement>('#preset-auto-interval');
-const presetAutoLabel = document.querySelector<HTMLSpanElement>('#preset-auto-label');
-const presetLibrarySelect = document.querySelector<HTMLSelectElement>('#preset-library-select');
-const visualRandomButton = document.querySelector<HTMLButtonElement>('#visual-random');
-const visualFavoriteButton = document.querySelector<HTMLButtonElement>('#visual-favorite');
-const visualFavoriteCount = document.querySelector<HTMLSpanElement>('#visual-favorite-count');
+const presetSelect = dom.presetSelect;
+const presetFileInput = dom.presetFileInput;
+const presetUrlInput = dom.presetUrlInput;
+const presetUrlButton = dom.presetUrlButton;
+const presetStatus = dom.presetStatus;
+const presetManifestInfo = dom.presetManifestInfo;
+const presetNextButton = dom.presetNextButton;
+const presetAutoToggle = dom.presetAutoToggle;
+const presetAutoIntervalInput = dom.presetAutoIntervalInput;
+const presetAutoLabel = dom.presetAutoLabel;
+const presetLibrarySelect = dom.presetLibrarySelect;
+const visualRandomButton = dom.visualRandomButton;
+const visualFavoriteButton = dom.visualFavoriteButton;
+const visualFavoriteCount = dom.visualFavoriteCount;
+const pmOpacityInput = dom.pmOpacityInput;
+const pmBlendModeSelect = dom.pmBlendModeSelect;
+const pmAudioOpacityToggle = dom.pmAudioOpacityToggle;
+const pmEnergyOpacityInput = dom.pmEnergyOpacityInput;
 let favoritesPanel: HTMLDivElement | null = null;
 
 const presetControls = [
@@ -168,21 +110,13 @@ const presetControls = [
   presetAutoToggle,
   presetAutoIntervalInput
 ];
+
 let currentPresetId: string | null = null;
+let currentPresetUrl: string | null = null;
 let projectLayerReady = false;
 let autoCycleTimer: number | null = null;
 let currentLibrarySource: PresetLibrarySource = DEFAULT_LIBRARY_SOURCE;
 let currentEnergyLevel = 0;
-
-type FavoriteVisualState = {
-  id: string;
-  createdAt: string;
-  presetId: string | null;
-  presetLabel: string | null;
-  presetUrl: string | null;
-  projectOpacity: number;
-  liquidParams: ReturnType<typeof getLiquidParamsSnapshot>;
-};
 
 const FAVORITES_STORAGE_KEY = 'newliveweb:favorites:v1';
 
@@ -190,32 +124,60 @@ function getLiquidParamsSnapshot() {
   return { ...liquidLayer.params };
 }
 
-function computeEnergyCoefficient(data: { peak: number; rms: number }) {
-  const raw = Math.max(data.peak ?? 0, (data.rms ?? 0) * 1.5);
-  const clamped = Math.max(0, Math.min(1, raw));
-  return clamped;
+function getCurrentBlendParams() {
+  return projectLayer.getBlendParams();
 }
 
-function loadFavoritesFromStorage(): FavoriteVisualState[] {
-  try {
-    const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as FavoriteVisualState[];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+function buildCurrentVisualState(): VisualStateV1 {
+  const blend = getCurrentBlendParams();
+  const preset = currentPresetId ? findPresetById(currentPresetId) : null;
+  const presetUrl = currentPresetUrl ?? preset?.url ?? null;
+
+  return {
+    version: 1,
+    global: lastVisualState.global ? { ...lastVisualState.global } : undefined,
+    projectm: {
+      presetId: currentPresetId,
+      presetUrl,
+      opacity: blend.opacity,
+      blendMode: blend.blendMode,
+      audioDrivenOpacity: blend.audioDrivenOpacity,
+      energyToOpacityAmount: blend.energyToOpacityAmount
+    },
+    liquidMetal: getLiquidParamsSnapshot()
+  };
 }
 
-function saveFavoritesToStorage(favorites: FavoriteVisualState[]) {
-  try {
-    localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(favorites));
-  } catch {
-    // Non-fatal if storage is unavailable
-  }
+let favorites: FavoriteVisualState[] = loadFavoritesFromStorage(localStorage, FAVORITES_STORAGE_KEY, liquidLayer.params);
+let lastVisualState: VisualStateV1 = createDefaultVisualState(liquidLayer.params);
+const DIAGNOSTICS_THROTTLE_MS = 500;
+let lastDiagnosticsUpdate = 0;
+
+function syncBlendControlsFromLayer() {
+  const blend = projectLayer.getBlendParams();
+  if (pmOpacityInput) pmOpacityInput.value = blend.opacity.toFixed(2);
+  if (pmBlendModeSelect) pmBlendModeSelect.value = blend.blendMode;
+  if (pmAudioOpacityToggle) pmAudioOpacityToggle.checked = blend.audioDrivenOpacity;
+  if (pmEnergyOpacityInput) pmEnergyOpacityInput.value = String(blend.energyToOpacityAmount);
 }
 
-let favorites: FavoriteVisualState[] = loadFavoritesFromStorage();
+function applyBlendControlsToLayer() {
+  const rawOpacity = Number(pmOpacityInput?.value ?? 0.8);
+  const opacity = Math.min(1, Math.max(0, Number.isFinite(rawOpacity) ? rawOpacity : 0.8));
+  const blendMode = (pmBlendModeSelect?.value ?? 'add') as BlendMode;
+  const audioDrivenOpacity = Boolean(pmAudioOpacityToggle?.checked);
+  const rawAmount = Number(pmEnergyOpacityInput?.value ?? 0.3);
+  const energyToOpacityAmount = Math.min(1, Math.max(0, Number.isFinite(rawAmount) ? rawAmount : 0.3));
+
+  projectLayer.setBlendParams({
+    opacity,
+    blendMode,
+    audioDrivenOpacity,
+    energyToOpacityAmount
+  });
+
+  lastVisualState = buildCurrentVisualState();
+}
 
 function updateFavoriteCountLabel() {
   if (!visualFavoriteCount) return;
@@ -223,29 +185,42 @@ function updateFavoriteCountLabel() {
 }
 
 function applyFavoriteVisualState(fav: FavoriteVisualState) {
-  const preset = fav.presetId ? findPresetById(fav.presetId) : null;
-  if (projectLayerReady && (fav.presetUrl || preset?.url)) {
-    const url = fav.presetUrl || preset?.url!;
-    setPresetStatus(`Loading favorite: ${fav.presetLabel ?? url} ...`);
+  const preset = fav.state.projectm.presetId ? findPresetById(fav.state.projectm.presetId) : null;
+  const targetPresetId = fav.state.projectm.presetId ?? null;
+  const targetPresetUrl = fav.state.projectm.presetUrl || preset?.url || null;
+
+  if (projectLayerReady && targetPresetUrl) {
+    setPresetStatus(`Loading favorite: ${fav.label ?? targetPresetUrl} ...`);
     void (async () => {
       try {
         ensureProjectLayerReady();
-        await projectLayer.loadPresetFromUrl(url);
-        if (fav.presetId && findPresetById(fav.presetId)) {
-          currentPresetId = fav.presetId;
-          updatePresetSelectValue(fav.presetId);
+        await projectLayer.loadPresetFromUrl(targetPresetUrl);
+        currentPresetId = targetPresetId;
+        currentPresetUrl = targetPresetUrl;
+        if (targetPresetId && findPresetById(targetPresetId)) {
+          updatePresetSelectValue(targetPresetId);
         }
-        setPresetStatus(`Preset: ${fav.presetLabel ?? url}`);
+        setPresetStatus(`Preset: ${fav.label ?? targetPresetUrl}`);
       } catch (error) {
         const compatNote = getCompatNote(preset ?? null);
         handlePresetLoadError(`Failed to load favorite preset${compatNote}`, error);
       }
     })();
+  } else {
+    currentPresetId = targetPresetId;
+    currentPresetUrl = targetPresetUrl;
   }
 
-  liquidLayer.params = { ...liquidLayer.params, ...fav.liquidParams };
+  liquidLayer.params = { ...fav.state.liquidMetal };
   liquidLayer.updateParams();
-  projectLayer.setOpacity(fav.projectOpacity);
+  projectLayer.setBlendParams({
+    opacity: fav.state.projectm.opacity,
+    audioDrivenOpacity: fav.state.projectm.audioDrivenOpacity,
+    energyToOpacityAmount: fav.state.projectm.energyToOpacityAmount,
+    blendMode: fav.state.projectm.blendMode
+  });
+  lastVisualState = cloneVisualState(fav.state);
+  syncBlendControlsFromLayer();
 }
 
 function ensureFavoritesPanel() {
@@ -304,7 +279,7 @@ function refreshFavoritesPanel() {
 
   if (!favorites.length) {
     const empty = document.createElement('div');
-    empty.textContent = 'No favorites yet. Use ★ to save.';
+    empty.textContent = "No favorites yet. Use 'Favorite' to save.";
     empty.style.cssText = 'color:#6b7280;padding:8px 0;';
     list.appendChild(empty);
     return;
@@ -320,7 +295,7 @@ function refreshFavoritesPanel() {
       const titleRow = document.createElement('div');
       titleRow.style.cssText = 'display:flex;justify-content:space-between;gap:8px;';
       const label = document.createElement('span');
-      label.textContent = fav.presetLabel ?? '[no preset]';
+      label.textContent = fav.label ?? '[no preset]';
       label.style.cssText = 'color:#e5e7eb;max-width:180px;white-space:nowrap;text-overflow:ellipsis;overflow:hidden;';
       const ts = document.createElement('span');
       ts.textContent = new Date(fav.createdAt).toLocaleTimeString();
@@ -342,7 +317,7 @@ function refreshFavoritesPanel() {
       deleteBtn.style.cssText = 'flex:0 0 auto;padding:2px 6px;font-size:11px;border-radius:4px;border:1px solid rgba(248,113,113,0.6);background:rgba(248,113,113,0.08);color:#fecaca;cursor:pointer;';
       deleteBtn.addEventListener('click', () => {
         favorites = favorites.filter((f) => f.id !== fav.id);
-        saveFavoritesToStorage(favorites);
+        saveFavoritesToStorage(localStorage, FAVORITES_STORAGE_KEY, favorites);
         updateFavoriteCountLabel();
         refreshFavoritesPanel();
       });
@@ -520,6 +495,7 @@ const reloadLibraryPresets = async (source: PresetLibrarySource) => {
   setLibrarySelectValue(source);
   stopAutoCycle('Auto-cycle paused by library change');
   currentPresetId = null;
+  currentPresetUrl = null;
   await loadPresetManifestForSource(source);
 };
 
@@ -550,6 +526,7 @@ const markPresetAsBrokenAndRefresh = (preset?: { id: string } | PresetDescriptor
   markPresetAsBroken(presetId);
   if (currentPresetId === presetId) {
     currentPresetId = null;
+    currentPresetUrl = null;
   }
   refreshPresetSelect();
   updatePresetCyclerAvailability();
@@ -580,10 +557,12 @@ const randomInRange = (min: number, max: number) => {
 
 const applyRandomVisualState = async () => {
   const energy = currentEnergyLevel || 0.5;
+  const seed = createRandomSeed();
+  const rng = createSeededRng(seed);
 
   const presets = getAllPresets();
   const hasPresets = presets.length > 0;
-  const maybePreset = hasPresets ? presets[Math.floor(Math.random() * presets.length)] : null;
+  const maybePreset = hasPresets ? presets[rng.int(0, presets.length)] : null;
 
   if (projectLayerReady && maybePreset) {
     setPresetStatus(`Random loading: ${maybePreset.label} ...`);
@@ -591,6 +570,7 @@ const applyRandomVisualState = async () => {
       ensureProjectLayerReady();
       await projectLayer.loadPresetFromUrl(maybePreset.url);
       currentPresetId = maybePreset.id;
+      currentPresetUrl = maybePreset.url;
       updatePresetSelectValue(maybePreset.id);
       setPresetStatus(`Preset: ${maybePreset.label}`);
     } catch (error) {
@@ -598,23 +578,27 @@ const applyRandomVisualState = async () => {
       handlePresetLoadError(`Failed to load preset${compatNote}`, error);
       markPresetAsBrokenAndRefresh(maybePreset);
     }
+  } else {
+    currentPresetId = maybePreset?.id ?? null;
+    currentPresetUrl = maybePreset?.url ?? null;
   }
 
   const e = energy;
-  const params = liquidLayer.params;
-  params.brightness = randomInRange(0.6, 2.0) * (0.7 + e * 0.6);
-  params.timeScale = randomInRange(0.4, 3.0) * (0.6 + e * 0.8);
-  params.iterations = Math.round(randomInRange(5, 10));
-  params.waveAmplitude = randomInRange(0.2, 1.0) * (0.5 + e * 0.7);
-  params.mouseInfluence = randomInRange(0.2, 3.0);
-  params.metallicAmount = randomInRange(0, 0.3) * (0.5 + e * 0.5);
-  params.metallicSpeed = randomInRange(0.5, 3.0) * (0.5 + e * 0.8);
-  params.audioReactive = true;
-  params.audioSensitivity = randomInRange(0.6, 1.6);
+  const nextLiquid = randomizeLiquidMetalParams(e, rng);
+  liquidLayer.params = { ...liquidLayer.params, ...nextLiquid };
   liquidLayer.updateParams();
 
-  const targetOpacity = randomInRange(0.5, 1.0) * (0.6 + e * 0.7);
-  projectLayer.setOpacity(targetOpacity);
+  const blend = randomizeBlendParams(e, rng);
+  projectLayer.setBlendParams(blend);
+  syncBlendControlsFromLayer();
+
+  // 记录当前随机生成的 VisualState 以便收藏/预览
+  const nextState: VisualStateV1 = {
+    ...buildCurrentVisualState(),
+    global: { seed }
+  };
+  // 记录最近一次随机的 VisualState，供收藏/复用
+  lastVisualState = nextState;
 };
 
 function updatePresetCyclerAvailability() {
@@ -684,6 +668,7 @@ const cycleToNextPreset = async (origin: 'manual' | 'auto') => {
     ensureProjectLayerReady();
     await projectLayer.loadPresetFromUrl(nextPreset.url);
     currentPresetId = nextPreset.id;
+    currentPresetUrl = nextPreset.url;
     updatePresetSelectValue(nextPreset.id);
     setPresetStatus(`Preset: ${nextPreset.label}`);
   } catch (error) {
@@ -709,6 +694,7 @@ currentLibrarySource = getInitialLibrarySource();
 setLibrarySelectValue(currentLibrarySource);
 void loadPresetManifestForSource(currentLibrarySource);
 updateFavoriteCountLabel();
+syncBlendControlsFromLayer();
 
 (async () => {
   // 先添加液态金属层
@@ -722,7 +708,7 @@ updateFavoriteCountLabel();
     }
   }
 
-  // ProjectM层初始化可能失败，使用try-catch包裹
+  // ProjectM 层初始化可能失败，使用 try-catch 包裹
   try {
     await sceneManager.addLayer(projectLayer);
     console.log('✅ ProjectM layer initialized');
@@ -737,7 +723,7 @@ updateFavoriteCountLabel();
   // 显示控制面板
   liquidControlPanel.show();
 
-  // 添加快捷键: 按 'L' 键切换控制面板
+  // 添加快捷键：按 'L' 键切换控制面板
   window.addEventListener('keydown', (e) => {
     if (e.key === 'l' || e.key === 'L') {
       liquidControlPanel.toggle();
@@ -756,13 +742,13 @@ updateFavoriteCountLabel();
   bindAudioResumeOnGesture();
 })();
 
-const fileInput = document.querySelector<HTMLInputElement>('#audio-file');
-const urlInput = document.querySelector<HTMLInputElement>('#audio-url');
-const urlButton = document.querySelector<HTMLButtonElement>('#audio-url-load');
-const toggleButton = document.querySelector<HTMLButtonElement>('#audio-toggle');
-const volumeSlider = document.querySelector<HTMLInputElement>('#audio-volume');
-const statusLabel = document.querySelector<HTMLSpanElement>('#audio-status');
-const timeLabel = document.querySelector<HTMLSpanElement>('#audio-time');
+const fileInput = dom.audioFileInput;
+const urlInput = dom.audioUrlInput;
+const urlButton = dom.audioUrlButton;
+const toggleButton = dom.audioToggle;
+const volumeSlider = dom.audioVolumeInput;
+const statusLabel = dom.audioStatus;
+const timeLabel = dom.audioTime;
 let autoAudioAttempted = false;
 let audioResumeBound = false;
 
@@ -783,11 +769,11 @@ function bindAudioResumeOnGesture() {
     // So we must start audio loading synchronously inside the gesture handler.
 
     // Load & play the local test track on first user gesture.
-    if (!audioController.isReady) {
+    if (!audioBus.isReady) {
       console.log(`[Audio] Attempting to load: ${TEST_TRACK_URL}`);
       console.log(`[Audio] File path: ${TEST_TRACK_FS_PATH}`);
 
-      const loadPromise = audioController.loadUrl(TEST_TRACK_URL);
+      const loadPromise = audioBus.loadUrl(TEST_TRACK_URL);
       void (async () => {
         try {
           // Optional fetch diagnostics (does not gate user activation).
@@ -799,7 +785,7 @@ function bindAudioResumeOnGesture() {
           await loadPromise;
 
           // Enforce 80% volume always (gain node exists after load).
-          audioController.setVolume(0.8);
+          audioBus.setVolume(0.8);
           if (volumeSlider) volumeSlider.value = '0.8';
 
           setStatus(`✅ Loaded: ${TEST_TRACK_FS_PATH}`);
@@ -809,12 +795,12 @@ function bindAudioResumeOnGesture() {
           console.error('Test track auto-load failed:', error);
           console.log('Check if file exists at:', TEST_TRACK_FS_PATH);
           console.log('Vite fs.allow should include: D:/test MP3');
-          setStatus(`❌ Test track unavailable (see console)`, true);
+          setStatus(`⚠️ Test track unavailable (see console)`, true);
         }
       })();
     } else {
       // Already loaded; just enforce volume.
-      audioController.setVolume(0.8);
+      audioBus.setVolume(0.8);
       if (volumeSlider) volumeSlider.value = '0.8';
     }
   };
@@ -849,13 +835,13 @@ const formatTime = (seconds: number) => {
 
 const updatePlayButton = () => {
   if (!toggleButton) return;
-  toggleButton.textContent = audioController.isPlaying ? 'Pause' : 'Play';
+  toggleButton.textContent = audioBus.isPlaying ? 'Pause' : 'Play';
 };
 
 const updateTimeline = () => {
   if (!timeLabel) return;
-  const current = formatTime(audioController.currentTime);
-  const total = formatTime(audioController.duration);
+  const current = formatTime(audioBus.currentTime);
+  const total = formatTime(audioBus.duration);
   timeLabel.textContent = `${current} / ${total}`;
 };
 
@@ -864,7 +850,7 @@ fileInput?.addEventListener('change', async (event) => {
   const file = target.files?.[0];
   if (!file) return;
   try {
-    await audioController.loadFile(file);
+    await audioBus.loadFile(file);
     setStatus(`Loaded: ${file.name}`);
     enablePlaybackControls();
     updatePlayButton();
@@ -881,7 +867,7 @@ urlButton?.addEventListener('click', async () => {
     return;
   }
   try {
-    await audioController.loadUrl(url);
+    await audioBus.loadUrl(url);
     setStatus(`Streaming: ${url}`);
     enablePlaybackControls();
     updatePlayButton();
@@ -892,22 +878,44 @@ urlButton?.addEventListener('click', async () => {
 });
 
 toggleButton?.addEventListener('click', () => {
-  audioController.toggle();
+  audioBus.toggle();
   updatePlayButton();
 });
 
 volumeSlider?.addEventListener('input', (event) => {
   const slider = event.target as HTMLInputElement;
-  audioController.setVolume(Number(slider.value));
+  audioBus.setVolume(Number(slider.value));
 });
 
-audioController.onFrame((data) => {
-  projectLayer.addAudioData(data.pcm);
-  // 传递音频数据给液态金属层
-  liquidLayer.setAudioBands(data.bands);
-  currentEnergyLevel = computeEnergyCoefficient({ peak: data.peak, rms: data.rms });
-  updatePlayButton();
-  updateTimeline();
+pmBlendModeSelect?.addEventListener('change', () => {
+  applyBlendControlsToLayer();
+});
+
+pmOpacityInput?.addEventListener('input', () => {
+  applyBlendControlsToLayer();
+});
+
+pmAudioOpacityToggle?.addEventListener('change', () => {
+  applyBlendControlsToLayer();
+});
+
+pmEnergyOpacityInput?.addEventListener('change', () => {
+  applyBlendControlsToLayer();
+});
+
+audioBus.onFrame((frame: AudioFrame) => {
+  projectLayer.setAudioFrame(frame);
+  liquidLayer.setAudioFrame(frame);
+  currentEnergyLevel = frame.energy;
+  const now = performance.now();
+  if (now - lastDiagnosticsUpdate >= DIAGNOSTICS_THROTTLE_MS) {
+    diagnosticsPanel.updateAudioContext(audioBus.audioContextState);
+    diagnosticsPanel.updateAudioFrame({ energy: frame.energy, rms: frame.rms, peak: frame.peak });
+    diagnosticsPanel.updateProjectM((globalThis as any).__projectm_verify ?? {});
+    diagnosticsPanel.updateRenderer(sceneManager.getRendererInfo());
+    updateTimeline();
+    lastDiagnosticsUpdate = now;
+  }
 });
 
 // (moved above as function declaration so it can be called earlier)
@@ -937,6 +945,7 @@ presetSelect?.addEventListener('change', async (event) => {
     ensureProjectLayerReady();
     await projectLayer.loadPresetFromUrl(preset.url);
     currentPresetId = presetId;
+    currentPresetUrl = preset.url;
     setPresetStatus(`Preset: ${preset.label}`);
     if (presetAutoToggle?.checked) {
       scheduleAutoCycle();
@@ -981,6 +990,7 @@ presetFileInput?.addEventListener('change', async (event) => {
     const presetData = await file.text();
     projectLayer.loadPresetFromData(presetData);
     currentPresetId = null;
+    currentPresetUrl = `file:${file.name}`;
     updatePresetSelectValue(null);
     stopAutoCycle();
     setPresetStatus(`Preset: ${file.name}`);
@@ -1004,6 +1014,7 @@ presetUrlButton?.addEventListener('click', async () => {
     ensureProjectLayerReady();
     await projectLayer.loadPresetFromUrl(url);
     currentPresetId = null;
+    currentPresetUrl = url;
     updatePresetSelectValue(null);
     stopAutoCycle();
     setPresetStatus(`Preset: ${url}`);
@@ -1018,19 +1029,18 @@ visualRandomButton?.addEventListener('click', () => {
 });
 
 visualFavoriteButton?.addEventListener('click', () => {
-  const preset = currentPresetId ? findPresetById(currentPresetId) : null;
-  const snapshot = getLiquidParamsSnapshot();
+  const state = buildCurrentVisualState();
+  const preset = state.projectm.presetId ? findPresetById(state.projectm.presetId) : null;
+
   const favorite: FavoriteVisualState = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     createdAt: new Date().toISOString(),
-    presetId: preset?.id ?? null,
-    presetLabel: preset?.label ?? null,
-    presetUrl: preset?.url ?? null,
-    projectOpacity: projectLayer.getOpacity(),
-    liquidParams: snapshot
+    label: preset?.label ?? state.projectm.presetUrl ?? null,
+    state
   };
+  lastVisualState = state;
   favorites = [...favorites, favorite];
-  saveFavoritesToStorage(favorites);
+  saveFavoritesToStorage(localStorage, FAVORITES_STORAGE_KEY, favorites);
   updateFavoriteCountLabel();
   setStatus('Favorited current visual state');
 });
@@ -1045,11 +1055,11 @@ visualFavoriteCount?.addEventListener('click', () => {
   }
 });
 
-window.addEventListener('beforeunload', () => audioController.dispose());
+window.addEventListener('beforeunload', () => audioBus.dispose());
 
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
-    audioController.dispose();
+    audioBus.dispose();
     cameraLayer?.dispose();
   });
 }

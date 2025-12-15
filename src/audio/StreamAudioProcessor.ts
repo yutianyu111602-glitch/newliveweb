@@ -305,6 +305,10 @@ export class StreamAudioProcessor {
     return this.sourceType;
   }
 
+  get currentSampleRate(): number {
+    return this.audioContext?.sampleRate ?? this.config.sampleRate ?? 48000;
+  }
+
   private teardownMediaElement() {
     if (this.sourceNode) {
       this.sourceNode.disconnect();
