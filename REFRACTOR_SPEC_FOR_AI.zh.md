@@ -147,3 +147,26 @@ export class VisualStateStore {
 ## 6. 浜や粯鐗╂竻鍗曪紙AI 瀹屾垚姣忛樁娈靛繀椤讳骇鍑猴級
 
 - P0锛?  - 鏂板 Diagnostics 闈㈡澘鏂囦欢 + AudioBus 鏂囦欢 + AudioFrame 绫诲瀷鏂囦欢銆?  - `headless-verify` 閫氳繃锛宍artifacts/headless/report.json` 鏄剧ず canvas 闈炵┖/鍙樺寲锛屼笖鏃犺嚧鍛介敊璇�?- P1锛?  - 鏂板 renderShell + VisualStateStore + paramSchema + seededRng + bootstrap锛沵ain.ts 鏄庢樉鍙樿杽銆?- P2锛?  - 鏂板 sampler/compositor锛涙彁渚涘紑鍏充笌寮哄害鍙傛暟锛堥粯璁ゅ叧闂互淇濊瘉绋冲畾锛夈�?
+
+## 2026 銀色·太空流體色彩規範（供前端/Shader/Compositor 參考）
+- 基礎色盤：
+  - 液態金屬基底 `#d8dde7` / 高光 `#fefefe` / 暗部 `#0f1118`；
+  - 黑洞藍黑漸層：`#060712 -> #0f1b2d -> #3f4b5f`（radial）；
+  - 等離子點綴：冰藍 `#21d8ff`、電紫 `#f14dff`，可選酸綠 `#b7ff4a` 作少量對比。
+- 材質語義：
+  - 銀色液態金屬：metalness 0.85~1.0，roughness 0.08~0.18，保持鏡面感；
+  - 太空塵/噪聲：粗糙度提高到 0.35~0.5，metalness 0.2~0.4，疊加細粒度雜訊；
+  - 黑洞縫隙：近似零反射，顏色鎖在 `#03040a`~`#0b0f1c`，可疊加內發光。
+- Shader/Compositor 建議：
+  - 背景用 radial gradient + curl noise flow map（低頻大尺度流動；高頻只 10~20%）；
+  - Overlay 保持 gamma 正確，Screen/SoftLight 為主，Add 只在高光極值，避免 double-gamma；
+  - Glow 只用在等離子點綴，閾值 tone-mapped 再做 bloom，防止全局泛白。
+- UI/數據層對齊：
+  - 控件/狀態用冰藍/電紫作強調色，禁用暖橙/棕；
+  - Diagnostics/提示用暗底 `#0f1118`，文字灰 `#c9d0da`，錯誤紅 `#ff5f6c`，成功綠 `#6de28d`。
+- 動態節奏：
+  - 背景流速 < 0.05 units/s，鏡面高光可有 0.2~0.3 的抖動幅度；
+  - 黑洞中心可做低頻收縮/脈衝（0.2~0.4 Hz），與音頻 energy 綁定 0.2~0.5 權重。
+- 禁忌：
+  - 不要大面積使用飽和紅/橙；
+  - 不要在不同層各自 gamma；統一在 Compositor / renderer outputColorSpace/toneMapping 控制。
