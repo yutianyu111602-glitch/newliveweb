@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Test</title>
+  <style>
+    body { margin: 0; background: red; }
+    canvas { width: 100vw; height: 100vh; background: blue; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <canvas id="test"></canvas>
+  </div>
+  <script type="module">
+    console.log('Script loaded');
+    const canvas = document.getElementById('test');
+    console.log('Canvas:', canvas);
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = 'green';
+      ctx.fillRect(0, 0, 200, 200);
+      console.log('Drew green square');
+    }
+  </script>
+</body>
+</html>

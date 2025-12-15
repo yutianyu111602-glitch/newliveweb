@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Simple Test</title>
+    <style>
+        body { 
+            margin: 0; 
+            background: linear-gradient(45deg, #667eea 0%, #764ba2 100%); 
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            font-family: Arial, sans-serif;
+        }
+        .container {
+            text-align: center;
+            background: rgba(255,255,255,0.9);
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }
+        h1 { color: #667eea; margin: 0 0 20px 0; }
+        .status { color: #28a745; font-size: 24px; margin: 10px 0; }
+        canvas { 
+            border: 3px solid #667eea; 
+            display: block;
+            margin: 20px auto;
+            background: #000;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎨 Vite Server Test</h1>
+        <div class="status">✅ Server is running!</div>
+        <div>Port: 5174</div>
+        <canvas id="test" width="400" height="300"></canvas>
+        <div id="info"></div>
+    </div>
+    
+    <script>
+        const canvas = document.getElementById('test');
+        const ctx = canvas.getContext('2d');
+        const info = document.getElementById('info');
+        
+        // Animated gradient
+        let hue = 0;
+        function animate() {
+            hue = (hue + 1) % 360;
+            
+            const gradient = ctx.createLinearGradient(0, 0, 400, 300);
+            gradient.addColorStop(0, `hsl(${hue}, 70%, 50%)`);
+            gradient.addColorStop(1, `hsl(${(hue + 180) % 360}, 70%, 50%)`);
+            
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, 400, 300);
+            
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 30px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText('Vite Works! 🚀', 200, 150);
+            
+            requestAnimationFrame(animate);
+        }
+        
+        animate();
+        info.innerHTML = `<p>✅ Canvas rendering</p><p>✅ JavaScript executing</p>`;
+    </script>
+</body>
+</html>

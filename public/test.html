@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Diagnostic Test</title>
+  <style>
+    body {
+      margin: 0;
+      background: #222;
+      color: #fff;
+      font-family: monospace;
+      padding: 20px;
+    }
+    #status { margin-bottom: 20px; }
+    canvas {
+      border: 2px solid #0f0;
+      display: block;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Diagnostic Test</h1>
+  <div id="status">Loading...</div>
+  <canvas id="test" width="800" height="600"></canvas>
+  
+  <script type="module">
+    const status = document.getElementById('status');
+    const canvas = document.getElementById('test');
+    
+    function log(msg) {
+      console.log(msg);
+      status.innerHTML += msg + '<br>';
+    }
+    
+    log('✅ Script loaded');
+    log('✅ Canvas found: ' + !!canvas);
+    
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      log('✅ 2D context obtained');
+      
+      // Draw a test pattern
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, 800, 600);
+      
+      ctx.fillStyle = '#f00';
+      ctx.fillRect(50, 50, 100, 100);
+      
+      ctx.fillStyle = '#0f0';
+      ctx.fillRect(200, 50, 100, 100);
+      
+      ctx.fillStyle = '#00f';
+      ctx.fillRect(350, 50, 100, 100);
+      
+      ctx.fillStyle = '#fff';
+      ctx.font = '24px monospace';
+      ctx.fillText('Canvas is working!', 50, 250);
+      
+      log('✅ Test pattern drawn');
+    }
+    
+    // Test Three.js
+    try {
+      const THREE = await import('three');
+      log('✅ Three.js loaded: v' + THREE.REVISION);
+    } catch (e) {
+      log('❌ Failed to load Three.js: ' + e.message);
+    }
+  </script>
+</body>
+</html>

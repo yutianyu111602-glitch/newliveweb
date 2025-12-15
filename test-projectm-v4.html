@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ProjectM V4 Test - Fixed Function Names</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        .control-panel {
+            background: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            background: #0e639c;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover {
+            background: #1177bb;
+        }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        #canvas {
+            width: 100%;
+            max-width: 800px;
+            height: 600px;
+            background: #000;
+            display: block;
+            margin: 20px auto;
+            border: 2px solid #0e639c;
+        }
+        .log {
+            background: #2d2d2d;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .log-entry {
+            margin: 5px 0;
+            padding: 5px;
+            border-left: 3px solid #0e639c;
+            padding-left: 10px;
+        }
+        .log-error { border-left-color: #f48771; color: #f48771; }
+        .log-success { border-left-color: #89d185; color: #89d185; }
+        .log-info { border-left-color: #3794ff; color: #3794ff; }
+    </style>
+</head>
+<body>
+    <h1>🎨 ProjectM WASM V4 Test (Fixed)</h1>
+    
+    <div class="control-panel">
+        <h3>测试控制</h3>
+        <button id="btnInit">1. Initialize ProjectM</button>
+        <button id="btnResize" disabled>2. Resize (800x600)</button>
+        <button id="btnRender" disabled>3. Start Render Loop</button>
+        <button id="btnStop" disabled>4. Stop Rendering</button>
+        <button id="btnDestroy" disabled>5. Destroy</button>
+        <button id="btnCheckExports">⚙️ Check WASM Exports</button>
+    </div>
+
+    <canvas id="canvas" width="800" height="600"></canvas>
+
+    <div class="log" id="log"></div>
+
+    <script>
+        // 保存原始console.log
+        const originalLog = console.log;
+        const originalError = console.error;
+        
+        // Logger
+        function log(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = document.createElement('div');
+            logEntry.className = `log-entry log-${type}`;
+            logEntry.textContent = `[${timestamp}] ${message}`;
+            document.getElementById('log').appendChild(logEntry);
+            document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
+            
+            // 使用原始console.log避免递归
+            originalLog.apply(console, [`[${timestamp}] ${message}`]);
+        }
+
+        // ProjectM State
+        let pmHandle = null;
+        let Module = null;
+        let renderLoopId = null;
+        let gl = null;
+
+        // 按钮引用
+        const btnInit = document.getElementById('btnInit');
+        const btnResize = document.getElementById('btnResize');
+        const btnRender = document.getElementById('btnRender');
+        const btnStop = document.getElementById('btnStop');
+        const btnDestroy = document.getElementById('btnDestroy');
+        const btnCheckExports = document.getElementById('btnCheckExports');
+
+        // 1. Initialize
+        btnInit.addEventListener('click', async () => {
+            log('=== 初始化 ProjectM V4 (Fixed) ===');
+            try {
+                btnInit.disabled = true;
+                log('🎨 ProjectM V4: Loading script...', 'info');
+                
+                // Load ProjectM script
+                const script = document.createElement('script');
+                script.src = '/projectm-runtime/projectm.js';
+                
+                await new Promise((resolve, reject) => {
+                    script.onload = resolve;
+                    script.onerror = reject;
+                    document.head.appendChild(script);
+                });
+                
+                log('📦 ProjectM script loaded', 'success');
+                
+                // Initialize WASM module
+                Module = await createProjectMModule({
+                    locateFile: (path) => {
+                        if (path.endsWith('.wasm')) {
+                            const wasmPath = '/projectm-runtime/projectm.wasm';
+                            log(`📂 locateFile: ${path} -> ${wasmPath}`, 'info');
+                            return wasmPath;
+                        }
+                        return path;
+                    },
+                    onRuntimeInitialized: () => {
+                        log('✅ WASM runtime initialized', 'success');
+                    }
+                });
+                
+                log('✅ WASM module initialized', 'success');
+                
+                // Check if functions exist
+                log('🔍 Checking function availability...', 'info');
+                const funcs = ['_pm_create_default', '_pm_destroy', '_pm_resize', '_pm_render_frame'];
+                const missing = funcs.filter(f => typeof Module[f] !== 'function');
+                
+                if (missing.length > 0) {
+                    throw new Error(`Missing functions: ${missing.join(', ')}`);
+                }
+                
+                log('✅ All functions available', 'success');
+                
+                // Create ProjectM instance - 使用Module._pm_create_default
+                log('🎨 Calling Module._pm_create_default(800, 600)...', 'info');
+                pmHandle = Module._pm_create_default(800, 600);
+                
+                if (!pmHandle || pmHandle === 0) {
+                    throw new Error('pm_create_default returned null/0');
+                }
+                
+                log(`✅ ProjectM instance created! Handle: ${pmHandle}`, 'success');
+                
+                // Initialize WebGL
+                const canvas = document.getElementById('canvas');
+                gl = canvas.getContext('webgl2');
+                if (!gl) {
+                    throw new Error('WebGL2 not supported');
+                }
+                log('✅ WebGL2 context created', 'success');
+                
+                // Enable buttons
+                btnResize.disabled = false;
+                btnRender.disabled = false;
+                btnDestroy.disabled = false;
+                
+                log('✅ 初始化完成！', 'success');
+                
+            } catch (error) {
+                log(`❌ ProjectM V4 initialization failed: ${error.message}`, 'error');
+                log(`Details: ${error}`, 'error');
+                if (error.stack) {
+                    log(`Stack: ${error.stack}`, 'error');
+                }
+                btnInit.disabled = false;
+            }
+        });
+
+        // 2. Resize
+        btnResize.addEventListener('click', () => {
+            try {
+                log('📐 Resizing to 800x600...', 'info');
+                Module._pm_resize(pmHandle, 800, 600);
+                log('✅ Resize successful', 'success');
+            } catch (error) {
+                log(`❌ Resize failed: ${error.message}`, 'error');
+            }
+        });
+
+        // 3. Start Render Loop
+        btnRender.addEventListener('click', () => {
+            if (renderLoopId) {
+                log('⚠️ Render loop already running', 'info');
+                return;
+            }
+            
+            log('🎬 Starting render loop...', 'info');
+            btnRender.disabled = true;
+            btnStop.disabled = false;
+            
+            let frameCount = 0;
+            const startTime = Date.now();
+            
+            function renderFrame() {
+                try {
+                    // Clear canvas
+                    gl.clearColor(0, 0, 0, 1);
+                    gl.clear(gl.COLOR_BUFFER_BIT);
+                    
+                    // Render ProjectM frame
+                    const currentTime = (Date.now() - startTime) / 1000.0;
+                    Module._pm_render_frame(pmHandle, currentTime, 0, 0, 800, 600);
+                    
+                    frameCount++;
+                    if (frameCount % 60 === 0) {
+                        log(`🎞️ Rendered ${frameCount} frames (${currentTime.toFixed(1)}s)`, 'info');
+                    }
+                    
+                    renderLoopId = requestAnimationFrame(renderFrame);
+                } catch (error) {
+                    log(`❌ Render error: ${error.message}`, 'error');
+                    stopRendering();
+                }
+            }
+            
+            renderFrame();
+        });
+
+        // 4. Stop Rendering
+        function stopRendering() {
+            if (renderLoopId) {
+                cancelAnimationFrame(renderLoopId);
+                renderLoopId = null;
+                btnRender.disabled = false;
+                btnStop.disabled = true;
+                log('⏹️ Render loop stopped', 'info');
+            }
+        }
+        btnStop.addEventListener('click', stopRendering);
+
+        // 5. Destroy
+        btnDestroy.addEventListener('click', () => {
+            try {
+                stopRendering();
+                
+                if (pmHandle) {
+                    log('🗑️ Destroying ProjectM instance...', 'info');
+                    Module._pm_destroy(pmHandle);
+                    pmHandle = null;
+                    log('✅ ProjectM destroyed', 'success');
+                }
+                
+                btnResize.disabled = true;
+                btnRender.disabled = true;
+                btnDestroy.disabled = true;
+                btnInit.disabled = false;
+                
+            } catch (error) {
+                log(`❌ Destroy failed: ${error.message}`, 'error');
+            }
+        });
+
+        // Check Exports
+        btnCheckExports.addEventListener('click', () => {
+            if (!Module) {
+                log('⚠️ Module not loaded yet', 'info');
+                return;
+            }
+            
+            log('=== WASM Exports Check ===', 'info');
+            const pmFunctions = [];
+            
+            for (const key in Module) {
+                if (key.includes('pm_') || key.includes('projectm')) {
+                    pmFunctions.push(key);
+                    log(`Found: ${key} = ${typeof Module[key]}`, 'success');
+                }
+            }
+            
+            log(`Total PM-related exports: ${pmFunctions.length}`, 'info');
+        });
+
+        log('📋 点击 "1. Initialize ProjectM" 开始测试', 'info');
+        log('ℹ️ 使用正确的 API: Module._pm_create_default, Module._pm_render_frame 等', 'info');
+    </script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Vite / tooling logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+vite.log
+
+# Runtime artifacts
+artifacts/
+
+# Presets (do not upload)
+public/presets/
+public/presets-curated/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local env files
+.env
+.env.*
+!.env.example
