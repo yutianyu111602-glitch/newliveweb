@@ -52,9 +52,9 @@ npm run build
 ## ProjectM 预设控制
 
 - 工具栏第二行用于管理 ProjectM 预设：
-	- 下拉框：列出 `src/config/presets.ts` 中定义的内置预设；选择后立即热加载。
-	- Import `.milk`：从本地上传任意 MilkDrop 预设文本，实时替换当前效果。
-	- Load URL：输入远程 `.milk` 链接（支持同源或可跨域文件），点击加载即可应用。
+  - 下拉框：列出 `src/config/presets.ts` 中定义的内置预设；选择后立即热加载。
+  - Import `.milk`：从本地上传任意 MilkDrop 预设文本，实时替换当前效果。
+  - Load URL：输入远程 `.milk` 链接（支持同源或可跨域文件），点击加载即可应用。
 - Next preset：手动切换到下一条内置预设，方便表演/演示快速轮播。
 - Auto-cycle + Interval：勾选后按照设定秒数自动轮播内置预设；加载自定义文件/URL 会自动退出轮播，确保舞台可控。
 - 想要扩展内置列表时，把 `.milk` 文件放在 `public/presets/` 并在 `src/config/presets.ts` 注册即可。
@@ -71,9 +71,10 @@ npm run build
 ## 运行时兼容性
 
 - 2025-12-11：`public/projectm-runtime/projectm.js` 手动移除了所有 `import.meta.url` 依赖（共两处），改为：
+
   1. `_scriptName` 初始化：使用 `document.currentScript.src` 或 `self.location.href` 推导脚本路径
   2. `wasmBase` 计算：改用 `_scriptName` 通过 `new URL()` 构建 WASM 基准路径，回退到 `"./"`
-  
+
   这样可避免在 Vite 动态注入或经典 `<script>` 环境里触发 `Cannot use 'import.meta' outside a module`。未来若重新生成该文件，请重新套用同样的 shim。
 
 ## 资源同步（MilkDrop MegaPack）
@@ -88,12 +89,11 @@ npm run sync:presets -- --limit=200
 ```
 
 - 参数说明：
-	- `--source=/absolute/path` 可覆盖默认打包目录。
-	- `--limit=200` 控制拷贝数量，防止一次性复制 13 万个文件。
-	- `--target=mega` 可切换输出子目录名。
+  - `--source=/absolute/path` 可覆盖默认打包目录。
+  - `--limit=200` 控制拷贝数量，防止一次性复制 13 万个文件。
+  - `--target=mega` 可切换输出子目录名。
 - 运行完成后 `public/presets/library-manifest.json` 会记录生成时间、来源路径与每个拷贝的 URL，前端会自动加载清单并追加到 UI 下拉列表，同时支持自动轮播。
 - 请遵守 `MilkDrop 130k+ Presets MegaPack` 的授权要求（大部分基于 CC-BY-NC-SA 3.0；详见 `PRESET LICENSE.txt`）。
 - `src/layers/`：所有可组合图层（LiquidMetal、ProjectM、未来的效果层）。
 
-欢迎直接在该目录继续开发，旧 `projectm-web-visualizer/` 不再接受新代码。*** End Patch
-```
+欢迎直接在该目录继续开发，旧 `projectm-web-visualizer/` 不再接受新代码。
