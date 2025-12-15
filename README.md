@@ -1,5 +1,16 @@
 # newliveweb
 
+<!--
+版本控制（Git）
+- GitHub: https://github.com/yutianyu111602-glitch/newliveweb
+- 默认分支: main
+- 版本号: 以 package.json 的 version 为准，遵循 SemVer（X.Y.Z）
+- 发版/打标记:
+	- git tag vX.Y.Z
+	- git push origin main --tags
+- 重要约束: 预设库不入仓库（已在 .gitignore 忽略 public/presets/ 与 public/presets-curated/）
+-->
+
 全新、干净的前端可视化工程：LiquidMetal 背景 + ProjectM 图层，面向 OBS / DJ 使用场景。
 
 > 说明：`projectm-web-visualizer/` 仅保留为历史 Demo/参考，**所有新功能都在 `newliveweb/` 实现**。
