@@ -28,14 +28,49 @@ async function waitForHttpOk(url, timeoutMs = 60_000) {
   throw lastErr ?? new Error('Timed out waiting for dev server');
 }
 
+async function killProcessTree(child) {
+  if (!child || typeof child.pid !== 'number') return;
+  if (process.platform === 'win32') {
+    // Ensure we kill cmd.exe and its descendants (npx/vite/node) so Node can exit.
+    await new Promise((resolve) => {
+      const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+        shell: false,
+      });
+      killer.on('exit', () => resolve());
+      killer.on('error', () => resolve());
+    });
+    return;
+  }
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    // ignore
+  }
+ }
+
 async function main() {
+  const args = process.argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log('verify-dev: start/reuse Vite then run Playwright verification');
+    console.log('Usage: node scripts/verify-dev.mjs');
+    console.log('Env: VERIFY_HOST, VERIFY_PORT, VERIFY_URL, VERIFY_OUT_DIR');
+    console.log(`Default VERIFY_URL: ${URL}`);
+    console.log(`Default VERIFY_OUT_DIR: ${OUT_DIR}`);
+    process.exitCode = 0;
+    return;
+  }
+
   await ensureDir(OUT_DIR);
   const devLogPath = path.join(OUT_DIR, 'dev-server.log');
 
   // If a dev server is already running (common when user keeps `npm run dev` in a separate terminal),
   // just reuse it and avoid spawning another Vite instance.
   try {
+    console.log(`[verify-dev] Checking existing dev server: ${URL}`);
     await waitForHttpOk(URL, 2_500);
+    console.log('[verify-dev] Reusing existing dev server');
     const env = { ...process.env, VERIFY_URL: URL, VERIFY_OUT_DIR: OUT_DIR };
     const verify = spawn(process.execPath, ['scripts/headless-verify.mjs'], {
       cwd: process.cwd(),
@@ -65,6 +100,7 @@ async function main() {
     // Some Windows environments intermittently throw spawn EINVAL when spawning .cmd shims.
     // Running through cmd.exe is the most reliable.
     const cmdLine = `npx --no-install vite --host=${HOST} --port=${PORT} --strictPort --clearScreen=false`;
+    console.log(`[verify-dev] Starting Vite via cmd.exe: ${cmdLine}`);
     vite = spawn('cmd.exe', ['/d', '/s', '/c', cmdLine], {
       cwd: process.cwd(),
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -74,6 +110,7 @@ async function main() {
   } else {
     const npxCmd = 'npx';
     const viteArgs = ['--no-install', 'vite', `--host=${HOST}`, `--port=${PORT}`, '--strictPort', '--clearScreen=false'];
+    console.log(`[verify-dev] Starting Vite via npx on ${HOST}:${PORT}`);
     vite = spawn(npxCmd, viteArgs, {
       cwd: process.cwd(),
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -111,7 +148,10 @@ async function main() {
   vite.stderr.on('data', onStartError);
 
   try {
+    console.log(`[verify-dev] Waiting for HTTP OK: ${URL}`);
     await waitForHttpOk(URL, 60_000);
+
+    console.log('[verify-dev] Running headless verification');
 
     // Run Playwright verification in a separate Node process to avoid module/loader edge cases.
     const env = { ...process.env, VERIFY_URL: URL, VERIFY_OUT_DIR: OUT_DIR };
@@ -135,19 +175,12 @@ async function main() {
     // Only stop Vite if we actually started it successfully.
     if (startedOk) {
       if (!exited) {
-        try {
-          vite.kill('SIGTERM');
-        } catch {
-          // ignore
-        }
+        console.log('[verify-dev] Stopping Vite');
+        await killProcessTree(vite);
       }
       await new Promise((r) => setTimeout(r, 800));
       if (!exited) {
-        try {
-          vite.kill('SIGKILL');
-        } catch {
-          // ignore
-        }
+        await killProcessTree(vite);
       }
     }
   }

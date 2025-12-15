@@ -5,11 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "guardrails": "node scripts/guardrails-check.mjs",
+    "lint": "tsc --noEmit",
+    "build": "npm run guardrails && tsc --noEmit && vite build",
     "preview": "vite preview",
     "sync:presets": "node scripts/sync-presets.mjs",
-    "verify:headless": "node scripts/headless-verify.mjs",
-    "verify:dev": "node scripts/verify-dev.mjs"
+    "verify:headless": "npm run guardrails && node scripts/headless-verify.mjs",
+    "verify:dev": "npm run guardrails && node scripts/verify-dev.mjs",
+    "verify:ci": "npm run guardrails && npm run lint && node scripts/verify-dev.mjs",
+    "verify:all": "npm run verify:ci"
   },
   "dependencies": {
     "three": "^0.170.0"
