@@ -140,7 +140,11 @@ export function initBeatTempoAnalyzer(
         };
 
         // 动态调整更新间隔：根据 worker 的建议
-        const suggestedIntervalMs = getNumber(data, "suggestedUpdateIntervalMs", 0);
+        const suggestedIntervalMs = getNumber(
+          data,
+          "suggestedUpdateIntervalMs",
+          0
+        );
         if (suggestedIntervalMs > 0) {
           const currentInterval = config.updateIntervalMs;
           // 避免频繁调整，至少相差 100ms 才更新

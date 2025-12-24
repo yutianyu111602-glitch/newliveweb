@@ -5,4 +5,6 @@ export interface Layer {
   update(deltaTime: number): void;
   dispose(): void;
   onResize?(width: number, height: number): void;
+  setEnabled?(enabled: boolean): void;
+  getOpacity?(): number;
 }

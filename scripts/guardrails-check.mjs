@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const projectRoot = path.resolve(new URL('..', import.meta.url).pathname);
+const projectRoot = path.dirname(fileURLToPath(import.meta.url)).replace(/\\/g, '/').replace('/scripts', '');
 
 /**
  * Guardrails goals:
@@ -24,6 +25,11 @@ const BAD_PATTERNS = [
   { name: 'broken-span-close', re: /<span>库模\?\?\/span>/g },
   // Broken TS template interpolation that becomes a literal "?{" sequence
   { name: 'broken-template-interpolation', re: /\?\{[A-Z0-9_]+\}/g }
+];
+
+const REQUIRED_VENDOR_RESOURCES = [
+  'public/vendor/mediapipe/selfie_segmentation/selfie_segmentation.tflite',
+  'public/vendor/essentia/essentia-wasm.web.wasm'
 ];
 
 function formatLoc(file, index, content) {
@@ -66,6 +72,28 @@ async function main() {
       console.error(`- ${p.at} (${p.name})`);
     }
     console.error('\nFix the corruption (usually an encoding/formatter issue) before continuing.');
+    process.exit(1);
+  }
+
+  // Check critical vendor resources exist (prevent 404 in production)
+  const missingResources = [];
+  for (const res of REQUIRED_VENDOR_RESOURCES) {
+    const abs = path.join(projectRoot, res);
+    try {
+      await fs.stat(abs);
+    } catch {
+      missingResources.push(res);
+    }
+  }
+
+  if (missingResources.length) {
+    console.error('[guardrails] FAILED. Missing vendor resources (will 404 in production):');
+    for (const res of missingResources) {
+      console.error(`- ${res}`);
+    }
+    console.error('\nRun sync scripts:');
+    console.error('  npm run sync:mediapipe');
+    console.error('  npm run sync:essentia');
     process.exit(1);
   }
 

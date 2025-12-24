@@ -1,30 +1,36 @@
-import type { LibraryManifestV0 } from '../types/presets';
+import type { LibraryManifestV0 } from "../types/presets";
 
 type LoadManifestOptions = {
   requireWasmSafe?: boolean;
 };
 
 export async function loadLibraryManifest(
-  manifestUrl: string = '/presets/library-manifest.json',
+  manifestUrl: string = `${
+    import.meta.env.BASE_URL
+  }presets/library-manifest.json`,
   options: LoadManifestOptions = {}
 ): Promise<LibraryManifestV0> {
   const res = await fetch(manifestUrl, {
-    headers: { Accept: 'application/json' }
+    headers: { Accept: "application/json" },
   });
 
   if (!res.ok) {
-    throw new Error(`Failed to load manifest ${manifestUrl}: ${res.status} ${res.statusText}`);
+    throw new Error(
+      `Failed to load manifest ${manifestUrl}: ${res.status} ${res.statusText}. Ensure 'npm run sync:presets' has been run.`
+    );
   }
 
   const data = (await res.json()) as LibraryManifestV0;
 
   if (
-    data.version !== 'v0' &&
-    data.version !== 'v1' &&
-    data.version !== 'v2' &&
-    data.version !== 'v3'
+    data.version !== "v0" &&
+    data.version !== "v1" &&
+    data.version !== "v2" &&
+    data.version !== "v3"
   ) {
-    throw new Error(`Unsupported manifest version: ${String((data as any).version)}`);
+    throw new Error(
+      `Unsupported manifest version: ${String((data as any).version)}`
+    );
   }
 
   // For v0 we only rely on the base fields; extra fields are treated as optional.

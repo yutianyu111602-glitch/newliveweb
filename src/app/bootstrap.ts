@@ -46,6 +46,7 @@ import {
   PRESET_PREFETCH_TTL_MS,
 } from "../config/presetPrefetch";
 import { createPresetPredictor } from "../features/presets/presetPrediction";
+import { createPerformanceBudgetManager } from "../performance/PerformanceBudgetManager";
 import { CAMERA_FEATURE } from "../config/cameraSources";
 import { CameraLayer } from "../layers/CameraLayer";
 import { DepthLayer } from "../layers/DepthLayer";
@@ -814,17 +815,42 @@ export function bootstrapApp() {
   let beatTempoLastSetMs = 0;
   let pmAudioCadenceMode: "high" | "mid" | "low" = "high";
   let pmAudioCadenceLastSetMs = 0;
-  const computeInitialAudioFpsCap = () => {
+  
+  // 初始化预算管理器（基于分辨率选择初始等级）
+  const computeInitialQualityLevel = () => {
     const maxSide = Math.max(1, initialDisplay.w, initialDisplay.h);
-    if (maxSide >= 3000) return AUDIO_ANALYSIS_FPS_MID;
-    if (maxSide >= 2000) return AUDIO_ANALYSIS_FPS_MID;
-    return AUDIO_ANALYSIS_FPS_MAX;
+    if (maxSide >= 3000) return "medium";
+    if (maxSide >= 2000) return "high";
+    return "high";
   };
-  const computeInitialBeatTempoCap = () => {
-    const maxSide = Math.max(1, initialDisplay.w, initialDisplay.h);
-    if (maxSide >= 3000) return BEAT_TEMPO_FPS_MID;
-    return BEAT_TEMPO_FPS_HIGH;
+  
+  const initPerformanceBudget = (nowMs: number) => {
+    const initialLevel = computeInitialQualityLevel();
+    performanceBudgetManager.setLevel(initialLevel, nowMs);
   };
+  
+  // 统一的性能预算更新（替换原有的 3 个独立函数）
+  const updatePerformanceBudget = (timeMs: number) => {
+    // 记录帧时间到预算管理器
+    const p95 = computeFrameTimeP95(timeMs);
+    if (Number.isFinite(p95) && p95 > 0) {
+      performanceBudgetManager.recordFrameTime(p95);
+    }
+    
+    // Preset 加载期间强制降级
+    if (presetLoadPressureUntilMs && timeMs < presetLoadPressureUntilMs) {
+      performanceBudgetManager.setLevel("low", timeMs);
+      return;
+    }
+    
+    // 评估是否需要调整质量级别
+    const suggestedLevel = performanceBudgetManager.evaluateAdjustment(timeMs);
+    if (suggestedLevel) {
+      performanceBudgetManager.applyLevel(suggestedLevel, timeMs);
+    }
+  };
+  
+  // 保留旧函数接口用于向后兼容（内部委托给预算管理器）
   const applyAudioAnalysisCap = (
     next: number,
     reason: string,
@@ -844,39 +870,13 @@ export function bootstrapApp() {
   };
 
   const initAudioAnalysisCap = (nowMs: number) => {
-    const base = computeInitialAudioFpsCap();
-    applyAudioAnalysisCap(base, "init", nowMs);
+    // 委托给统一预算管理器
+    initPerformanceBudget(nowMs);
   };
 
   updateAudioAnalysisCap = (timeMs: number) => {
-    if (presetLoadPressureUntilMs && timeMs < presetLoadPressureUntilMs) {
-      applyAudioAnalysisCap(AUDIO_ANALYSIS_FPS_MIN, "preset", timeMs);
-      return;
-    }
-    if (!gateRenderStable) return;
-    if (
-      audioAnalysisLastSetMs &&
-      timeMs - audioAnalysisLastSetMs < AUDIO_ANALYSIS_COOLDOWN_MS
-    ) {
-      return;
-    }
-    const p95 = computeFrameTimeP95(timeMs);
-    if (!Number.isFinite(p95) || p95 <= 0) return;
-    let next = audioAnalysisFpsCap;
-    if (p95 >= RES_P95_THRESHOLD_MS) {
-      next = AUDIO_ANALYSIS_FPS_MIN;
-    } else if (p95 <= RES_P95_UP_THRESHOLD_MS) {
-      next = AUDIO_ANALYSIS_FPS_MAX;
-    } else {
-      next = AUDIO_ANALYSIS_FPS_MID;
-    }
-    const maxSide = Math.max(1, initialDisplay.w, initialDisplay.h);
-    const ceiling =
-      maxSide >= 2000 ? AUDIO_ANALYSIS_FPS_MID : AUDIO_ANALYSIS_FPS_MAX;
-    if (next > ceiling) next = ceiling;
-    if (next !== audioAnalysisFpsCap) {
-      applyAudioAnalysisCap(next, `p95:${p95.toFixed(2)}`, timeMs);
-    }
+    // 委托给统一预算管理器
+    updatePerformanceBudget(timeMs);
   };
 
   const applyBeatTempoCap = (next: number, reason: string, nowMs: number) => {
@@ -893,48 +893,13 @@ export function bootstrapApp() {
   };
 
   const initBeatTempoCap = (nowMs: number) => {
-    const base = computeInitialBeatTempoCap();
-    applyBeatTempoCap(base, "init", nowMs);
+    // 委托给统一预算管理器
+    initPerformanceBudget(nowMs);
   };
 
   updateBeatTempoCadence = (timeMs: number) => {
-    if (!beatTempo.getConfig().enabled) return;
-    if (presetLoadPressureUntilMs && timeMs < presetLoadPressureUntilMs) {
-      applyBeatTempoCap(BEAT_TEMPO_FPS_LOW, "preset", timeMs);
-      return;
-    }
-    if (
-      beatTempoLastSetMs &&
-      timeMs - beatTempoLastSetMs < BEAT_TEMPO_COOLDOWN_MS
-    ) {
-      return;
-    }
-    const p95 = computeFrameTimeP95(timeMs);
-    let next = beatTempoFpsCap;
-    if (!gateRenderStable) {
-      next = BEAT_TEMPO_FPS_LOW;
-    } else if (!gateAudioValid) {
-      next = BEAT_TEMPO_FPS_LOW;
-    } else if (Number.isFinite(p95) && p95 >= RES_P95_THRESHOLD_MS) {
-      next = BEAT_TEMPO_FPS_LOW;
-    } else if (Number.isFinite(p95) && p95 >= RES_P95_UP_THRESHOLD_MS) {
-      next = BEAT_TEMPO_FPS_MID;
-    } else if (Number.isFinite(p95) && p95 > 0) {
-      next = BEAT_TEMPO_FPS_HIGH;
-    }
-    const maxSide = Math.max(1, initialDisplay.w, initialDisplay.h);
-    const ceiling = maxSide >= 3000 ? BEAT_TEMPO_FPS_MID : BEAT_TEMPO_FPS_HIGH;
-    if (next > ceiling) next = ceiling;
-    if (next !== beatTempoFpsCap) {
-      const reason = !gateRenderStable
-        ? "render"
-        : !gateAudioValid
-        ? "audio"
-        : Number.isFinite(p95) && p95 > 0
-        ? `p95:${p95.toFixed(2)}`
-        : "stable";
-      applyBeatTempoCap(next, reason, timeMs);
-    }
+    // 委托给统一预算管理器
+    updatePerformanceBudget(timeMs);
   };
 
   const applyProjectMAudioCadence = (
@@ -966,37 +931,9 @@ export function bootstrapApp() {
   };
 
   updateProjectMAudioCadence = (timeMs: number) => {
-    if (presetLoadPressureUntilMs && timeMs < presetLoadPressureUntilMs) {
-      applyProjectMAudioCadence("low", "preset", timeMs);
-      return;
-    }
-    if (
-      pmAudioCadenceLastSetMs &&
-      timeMs - pmAudioCadenceLastSetMs < PM_AUDIO_FEED_COOLDOWN_MS
-    ) {
-      return;
-    }
-    const p95 = computeFrameTimeP95(timeMs);
-    let mode = pmAudioCadenceMode;
-    if (!gateRenderStable || !gateAudioValid) {
-      mode = "low";
-    } else if (Number.isFinite(p95) && p95 >= RES_P95_THRESHOLD_MS) {
-      mode = "low";
-    } else if (Number.isFinite(p95) && p95 >= RES_P95_UP_THRESHOLD_MS) {
-      mode = "mid";
-    } else if (Number.isFinite(p95) && p95 > 0) {
-      mode = "high";
-    }
-    const maxSide = Math.max(1, initialDisplay.w, initialDisplay.h);
-    if (maxSide >= 3000 && mode === "high") mode = "mid";
-    if (mode !== pmAudioCadenceMode) {
-      const reason = !gateRenderStable
-        ? "render"
-        : !gateAudioValid
-        ? "audio"
-        : Number.isFinite(p95) && p95 > 0
-        ? `p95:${p95.toFixed(2)}`
-        : "stable";
+    // 委托给统一预算管理器
+    updatePerformanceBudget(timeMs);
+  };
       applyProjectMAudioCadence(mode, reason, timeMs);
     }
   };
@@ -2198,6 +2135,25 @@ export function bootstrapApp() {
         presetPredictor.reset();
         return { reset: true };
       },
+      
+      // 性能预算管理器诊断 API
+      getPerformanceBudgetStats: () => {
+        return performanceBudgetManager.getStats();
+      },
+      setPerformanceQualityLevel: (level: string) => {
+        const validLevels = ["ultra", "high", "medium", "low", "minimal"];
+        if (!validLevels.includes(level)) {
+          return { error: `Invalid level. Use: ${validLevels.join(", ")}` };
+        }
+        const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+        performanceBudgetManager.setLevel(level as any, nowMs);
+        return { level, timestamp: nowMs };
+      },
+      resetPerformanceBudget: () => {
+        performanceBudgetManager.reset();
+        return { reset: true };
+      },
+      
       hideTopologyOverlay: () => {
         try {
           decisionTopologyOverlay.hide();
@@ -4177,6 +4133,38 @@ export function bootstrapApp() {
   const presetPredictor = createPresetPredictor();
   let presetPredictionEnabled = true; // 可通过 UI 或 config 关闭
 
+  // 统一性能预算管理器
+  const performanceBudgetManager = createPerformanceBudgetManager("high");
+  
+  // 注册回调 - 统一管理所有子系统预算
+  performanceBudgetManager.onAudioAnalysisFpsChange((fps) => {
+    audioAnalysisFpsCap = Math.round(fps);
+    audioBus.setAnalysisFpsCap(audioAnalysisFpsCap);
+    recordControlPlaneEvent("AUDIO_FPS", `${audioAnalysisFpsCap}:budget`);
+  });
+  
+  performanceBudgetManager.onBeatTempoIntervalChange((intervalMs) => {
+    // Beat tempo 使用 FPS，需要转换：fps = 1000 / intervalMs
+    const fps = 1000 / intervalMs;
+    beatTempoFpsCap = Math.max(BEAT_TEMPO_FPS_LOW, Math.min(BEAT_TEMPO_FPS_HIGH, fps));
+    recordControlPlaneEvent("BEAT_FPS", `${beatTempoFpsCap.toFixed(2)}:budget`);
+  });
+  
+  performanceBudgetManager.onPmAudioFeedIntervalChange((intervalMs) => {
+    // 根据 intervalMs 映射到 mode
+    const mode = intervalMs <= 33 ? "high" : intervalMs <= 50 ? "mid" : "low";
+    const fgMs = intervalMs;
+    const bgMs = Math.round(intervalMs * 1.5); // bg 比 fg 慢 50%
+    projectLayer.setAudioFeedIntervalMs(fgMs);
+    projectLayerBg.setAudioFeedIntervalMs(bgMs);
+    pmAudioCadenceMode = mode;
+    recordControlPlaneEvent("PM_AUDIO_FEED", `${mode}:${fgMs}/${bgMs}:budget`);
+  });
+  
+  performanceBudgetManager.onLevelChange((level) => {
+    console.log(`[PerformanceBudget] Quality level: ${level}`);
+  });
+
   /**
    * 记录 preset 切换到预测引擎
    * 在所有 currentPresetId 赋值点调用
@@ -4703,13 +4691,20 @@ export function bootstrapApp() {
         .filter((p) => !excludeIds?.has(p.id))
         .map((p) => p.id);
 
-      const predictions = presetPredictor.predict(currentId, candidateIds, count);
+      const predictions = presetPredictor.predict(
+        currentId,
+        candidateIds,
+        count
+      );
 
       for (const pred of predictions) {
         if (queued >= count) break;
         const preset = pool.find((p) => p.id === pred.presetId);
         if (preset && !alreadyQueued.has(preset.id)) {
-          enqueuePresetPrefetch(preset, `${reason}+predicted(${pred.reason},${pred.score.toFixed(2)})`);
+          enqueuePresetPrefetch(
+            preset,
+            `${reason}+predicted(${pred.reason},${pred.score.toFixed(2)})`
+          );
           alreadyQueued.add(preset.id);
           queued += 1;
         }

@@ -4,14 +4,20 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const DEFAULT_SOURCE = '/Users/masher/code/MilkDrop 130k+ Presets MegaPack 2025 2';
 const DEFAULT_LIMIT = Number(process.env.PRESET_LIMIT ?? '120');
 const DEFAULT_TARGET = 'mega';
 
 const __filename = fileURLToPath(import.meta.url);
 const projectRoot = path.resolve(__filename, '..', '..');
+const workspaceRoot = path.resolve(projectRoot, '..');
 const publicDir = path.join(projectRoot, 'public');
 const presetsDir = path.join(publicDir, 'presets');
+
+const DEFAULT_SOURCE_CANDIDATES = [
+  process.env.PRESET_SOURCE,
+  path.join(workspaceRoot, 'MilkDrop 130k+ Presets MegaPack 2025'),
+  path.join(workspaceRoot, 'MilkDrop 130k+ Presets MegaPack 2025 2'),
+].filter(Boolean);
 
 const argMap = process.argv.slice(2).reduce((acc, token) => {
   if (!token.startsWith('--')) return acc;
@@ -26,12 +32,14 @@ const resolveArg = (key, fallback) => {
   return value ?? fallback;
 };
 
-const sourceDir = path.resolve(resolveArg('source', DEFAULT_SOURCE));
+const defaultSource = DEFAULT_SOURCE_CANDIDATES[0] ?? projectRoot;
+const sourceDir = path.resolve(resolveArg('source', defaultSource));
 const limitValue = Number(resolveArg('limit', DEFAULT_LIMIT));
 const limit = Number.isFinite(limitValue) && limitValue > 0 ? limitValue : DEFAULT_LIMIT;
 const targetName = resolveArg('target', DEFAULT_TARGET);
 const destDir = path.join(presetsDir, targetName);
-const manifestPath = path.join(presetsDir, 'library-manifest.json');
+// Write manifest into the target folder to avoid overwriting the main full-library manifest.
+const manifestPath = path.join(destDir, 'library-manifest.json');
 
 const slugify = (value) =>
   value

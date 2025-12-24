@@ -32,6 +32,6 @@ export const DEFAULT_CAMERA_SOURCE: CameraSource = {
 };
 
 export const CAMERA_FEATURE: CameraFeatureConfig = {
-  enabled: false, // Set true to mount the CameraLayer placeholder.
+  enabled: true, // Mounted by default; permission is requested only when user selects camera background.
   source: DEFAULT_CAMERA_SOURCE
 };

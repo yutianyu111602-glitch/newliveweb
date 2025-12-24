@@ -15,17 +15,33 @@
 
 > 说明：`projectm-web-visualizer/` 仅保留为历史 Demo/参考，**所有新功能都在 `newliveweb/` 实现**。
 
+## 规格与计划（入口）
+
+- 权威总规格：`MASTER_SPEC.zh.md`
+- 文档索引与写作路由（防爆炸）：`DOCS_INDEX.zh.md`
+- 数据接口契约：`DATA_INTERFACES.zh.md`
+- 基础设施引入计划：`INFRASTRUCTURE_PLAN.zh.md`
+
+## 2025-12 更新（与当前代码对齐）
+
+- 应用入口已迁移为：`src/main.ts` → `src/app/bootstrap.ts`（主装配逻辑在 bootstrap）。
+- 音频主链路以 `src/audio/AudioBus.ts` 为唯一分发源（内部使用 `StreamAudioProcessor`）；`AudioController` 仍保留但不作为主入口使用。
+- 支持本地输入设备捕获：工具栏 `Input` 下拉 + `Use input` 可通过浏览器权限捕获 USB mixer/声卡输入驱动画面（默认音量为 0，避免反馈）。
+- 预设管理已抽为 `src/features/presets/PresetsController.ts`；收藏面板为 `src/features/favorites/FavoritesPanel.ts`。
+- Random / Favorite 触发的 preset 加载也统一通过 `PresetsController` 完成（`bootstrap` 不再直接调用 `ProjectMLayer.loadPresetFromUrl(...)`）。
+- 验收推荐走：`npm run verify:dev`（会产出 `newliveweb/artifacts/headless/*` 并输出 Summary；`diff.png`/`viz-canvas-a/b.png` 用于直观看变化，不要只看 `screenshot.png`）。
+
 ## 技术栈
 
 - Vite + TypeScript
 - Three.js（Layer 管线 + ShaderMaterial）
-- Web Audio API（下一阶段接入 StreamAudioProcessor）
+- Web Audio API（`AudioBus` + `StreamAudioProcessor`）
 - ProjectM WASM（`public/projectm-runtime/projectm.{js,wasm}`）
 
 ## 开发
 
 ```bash
-cd /Users/masher/code/Mac_Development_Package_copy/newliveweb
+cd newliveweb
 npm install
 npm run dev   # 默认 5173/5174 端口，终端会提示实际端口
 
@@ -33,14 +49,28 @@ npm run dev   # 默认 5173/5174 端口，终端会提示实际端口
 npm run build
 ```
 
+### Windows 快速启动（推荐）
+
+```powershell
+cd C:\Users\pc\code\newliveweb
+npm install
+npm run dev -- --host 127.0.0.1 --port 5174 --strictPort
+```
+
+### 快速验收（推荐）
+
+```bash
+npm run verify:dev
+```
+
 ## 当前状态
 
 - ✅ Layer 架构：`SceneManager` + `Layer` 接口，支持动态添加/销毁图层。
 - ✅ LiquidMetalLayer：新版 ShaderMaterial，响应时间与鼠标，运行在主 Canvas。
 - ✅ ProjectMLayer：封装 `ProjectMEngine`（加载 `/projectm-runtime/projectm.{js,wasm}`），默认 preset `public/presets/default.milk`，以 CanvasTexture + AdditiveBlending 覆盖 LiquidMetal。
-- ✅ 音频管线：`StreamAudioProcessor` + `AudioController` 已接入，支持本地文件上传或 URL 流，实时把频段能量驱动 LiquidMetal，并把 PCM 推送到 ProjectM。
+- ✅ 音频管线：以 `src/audio/AudioBus.ts` 为主入口（内部包含分析/分发），支持本地文件与 URL；统一输出 `AudioFrame` 驱动 LiquidMetal，并把 PCM 推送到 ProjectM。
 - ✅ Preset 管理：工具栏支持预设下拉、`.milk` 导入、远程 URL 加载 & 自动轮播，底层由 `src/config/presets.ts` 管理内置清单（默认提供 Default / martin Liquid Gold / Geiss Starfish 1）。
-- ✅ 资源地址预填：工程会在 UI 中展示默认测试音乐目录 `/Users/masher/Music/网易云音乐/测试转换` 以及 MegaPack 预设目录 `/Users/masher/code/MilkDrop 130k+ Presets MegaPack 2025 2`，便于拖入或脚本同步。
+- ✅ 资源地址预填：UI 会显示“测试音乐目录/预设包目录”的标签（来源于 `src/config/paths.ts`），便于按你的本机路径进行同步或替换。
 
 ## 音频控制
 
@@ -84,7 +114,7 @@ npm run build
 - 运行脚本，把 MegaPack 中的 `.milk` 拷贝到 `public/presets/mega/**` 并生成清单：
 
 ```bash
-cd /Users/masher/code/Mac_Development_Package_copy/newliveweb
+cd newliveweb
 npm run sync:presets -- --limit=200
 ```
 
@@ -97,3 +127,11 @@ npm run sync:presets -- --limit=200
 - `src/layers/`：所有可组合图层（LiquidMetal、ProjectM、未来的效果层）。
 
 欢迎直接在该目录继续开发，旧 `projectm-web-visualizer/` 不再接受新代码。
+
+---
+
+## 维护提示（避免踩坑）
+
+- 文档权威入口是 `MASTER_SPEC.zh.md`；其余文档以“只追加”为原则做专题补充。
+- 不要在 Layer 内触碰 DOM/localStorage；UI/业务逻辑统一在 `app/*` 或 `features/*`。
+- 如果出现“没音频/不动/色偏”，优先看 Diagnostics 面板与 `artifacts/headless/*`，不要靠主观观感争论。

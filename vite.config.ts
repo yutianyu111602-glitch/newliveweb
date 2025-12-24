@@ -2,6 +2,7 @@ import { defineConfig } from 'vite';
 import glsl from 'vite-plugin-glsl';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 
 export default defineConfig({
   plugins: [
@@ -10,10 +11,20 @@ export default defineConfig({
       name: 'newliveweb-local-audio-dev',
       apply: 'serve',
       configureServer(server) {
-        const allowedRoot = path.resolve('D:/test MP3');
+        const envRoot = String(process.env.LOCAL_AUDIO_ROOT ?? '').trim();
+        const fallbackWin = process.platform === 'win32' ? 'D:/test MP3' : '';
+        const fallbackMac = process.platform === 'darwin' ? path.join(os.homedir(), 'Music') : '';
+        const allowedRootRaw = envRoot || fallbackWin || fallbackMac;
+        const allowedRoot = allowedRootRaw ? path.resolve(allowedRootRaw) : '';
 
         server.middlewares.use('/__local_audio', (req, res, next) => {
           try {
+            if (!allowedRoot) {
+              res.statusCode = 404;
+              res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+              res.end('Local audio proxy disabled (set LOCAL_AUDIO_ROOT)');
+              return;
+            }
             if (!req.url) return next();
 
             const url = new URL(req.url, 'http://localhost');
@@ -103,6 +114,9 @@ export default defineConfig({
   build: {
     target: 'esnext'
   },
+  worker: {
+    format: 'es'
+  },
   server: {
     port: 5174,
     host: '0.0.0.0', // Listen on all IPv4 addresses
@@ -111,10 +125,16 @@ export default defineConfig({
     fs: {
       // Dev-only: relax file serving restrictions so /@fs can serve local media.
       strict: false,
-      // Must explicitly allow project root + local test audio directory
-      // Vite normalizes Windows absolute paths inconsistently across code paths
-      // (sometimes with a leading '/'), so include both forms.
-      allow: ['.', 'D:/test MP3', '/D:/test MP3']
+      // Must explicitly allow project root + optional local test audio directory.
+      // Set `LOCAL_AUDIO_ROOT` to enable cross-platform local media serving.
+      allow: (() => {
+        const envRoot = String(process.env.LOCAL_AUDIO_ROOT ?? '').trim();
+        if (!envRoot) return ['.'];
+        const resolved = path.resolve(envRoot);
+        const variants = [resolved];
+        if (process.platform === 'win32') variants.push(`/${resolved.replace(/\\/g, '/')}`);
+        return ['.', ...variants];
+      })()
     }
   }
 });

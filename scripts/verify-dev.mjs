@@ -18,7 +18,9 @@ async function waitForHttpOk(url, timeoutMs = 60_000) {
   while (Date.now() - start < timeoutMs) {
     try {
       const res = await fetch(url, { method: 'GET' });
-      if (res.ok) return;
+      // Treat 2xx and 3xx as OK. In practice, a running dev server can respond with
+      // redirects (e.g. trailing slash normalization). We only need to know it's alive.
+      if (res.status >= 200 && res.status < 400) return;
       lastErr = new Error(`HTTP ${res.status} ${res.statusText}`);
     } catch (e) {
       lastErr = e;
@@ -26,6 +28,38 @@ async function waitForHttpOk(url, timeoutMs = 60_000) {
     await new Promise((r) => setTimeout(r, 400));
   }
   throw lastErr ?? new Error('Timed out waiting for dev server');
+}
+
+async function looksLikeViteIndexHtml(url, timeoutMs = 2_500) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { Accept: 'text/html' },
+      signal: controller.signal,
+    });
+    if (!(res.status >= 200 && res.status < 400)) return false;
+    const text = await res.text();
+    // Vite dev index HTML typically includes the client entry.
+    return text.includes('/@vite/client') || text.includes('"/@vite/client"') || text.includes("'/@vite/client'");
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function waitForViteDevServer(url, timeoutMs = 2_500) {
+  // A plain HTTP 200 at `/` can be a false positive (proxy, captive portal, stale service).
+  // Vite dev servers always expose `@vite/client`.
+  // Prefer checking the HTML for a Vite client reference (less flaky than requesting
+  // the client JS directly during transient dev-server hiccups).
+  if (await looksLikeViteIndexHtml(url, timeoutMs)) return;
+
+  await waitForHttpOk(url, timeoutMs);
+  const viteClientUrl = new URL('/@vite/client', url).toString();
+  await waitForHttpOk(viteClientUrl, timeoutMs);
 }
 
 async function killProcessTree(child) {
@@ -69,7 +103,7 @@ async function main() {
   // just reuse it and avoid spawning another Vite instance.
   try {
     console.log(`[verify-dev] Checking existing dev server: ${URL}`);
-    await waitForHttpOk(URL, 2_500);
+    await waitForViteDevServer(URL, 2_500);
     console.log('[verify-dev] Reusing existing dev server');
     const env = { ...process.env, VERIFY_URL: URL, VERIFY_OUT_DIR: OUT_DIR };
     const verify = spawn(process.execPath, ['scripts/headless-verify.mjs'], {
