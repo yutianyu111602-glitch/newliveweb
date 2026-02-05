@@ -1,137 +1,142 @@
 # newliveweb
 
-<!--
-版本控制（Git）
-- GitHub: https://github.com/yutianyu111602-glitch/newliveweb
-- 默认分支: main
-- 版本号: 以 package.json 的 version 为准，遵循 SemVer（X.Y.Z）
-- 发版/打标记:
-	- git tag vX.Y.Z
-	- git push origin main --tags
-- 重要约束: 预设库不入仓库（已在 .gitignore 忽略 public/presets/ 与 public/presets-curated/）
--->
+**开源实时视觉化平台** | Open-source Real-time Visualization Platform
 
-全新、干净的前端可视化工程：LiquidMetal 背景 + ProjectM 图层，面向 OBS / DJ 使用场景。
+> ⚠️ **项目正在开发中** - 预设包和音乐文件不包含在开源仓库中
 
-> 说明：`projectm-web-visualizer/` 仅保留为历史 Demo/参考，**所有新功能都在 `newliveweb/` 实现**。
+## 📌 项目简介
 
-## 规格与计划（入口）
+newliveweb 是一个基于 Web 的实时音乐视觉化平台，支持：
+- 音频分析与特征提取
+- ProjectM 视觉渲染
+- 预设管理与质量训练
+- WebAssembly 性能优化
 
-- 权威总规格：`MASTER_SPEC.zh.md`
-- 文档索引与写作路由（防爆炸）：`DOCS_INDEX.zh.md`
-- 数据接口契约：`DATA_INTERFACES.zh.md`
-- 基础设施引入计划：`INFRASTRUCTURE_PLAN.zh.md`
+## 🎯 核心功能
 
-## 2025-12 更新（与当前代码对齐）
+| 模块 | 功能 | 技术栈 |
+|------|------|--------|
+| **视觉渲染** | ProjectM 实时渲染 | WebAssembly + WebGL |
+| **音频分析** | 频谱、节奏检测 | Web Audio API |
+| **预设系统** | 预设加载、管理 | TypeScript |
+| **质量训练** | 机器学习质量评估 | Python + scikit-learn |
+| **前端框架** | 响应式 UI | TypeScript + Vite |
 
-- 应用入口已迁移为：`src/main.ts` → `src/app/bootstrap.ts`（主装配逻辑在 bootstrap）。
-- 音频主链路以 `src/audio/AudioBus.ts` 为唯一分发源（内部使用 `StreamAudioProcessor`）；`AudioController` 仍保留但不作为主入口使用。
-- 支持本地输入设备捕获：工具栏 `Input` 下拉 + `Use input` 可通过浏览器权限捕获 USB mixer/声卡输入驱动画面（默认音量为 0，避免反馈）。
-- 预设管理已抽为 `src/features/presets/PresetsController.ts`；收藏面板为 `src/features/favorites/FavoritesPanel.ts`。
-- Random / Favorite 触发的 preset 加载也统一通过 `PresetsController` 完成（`bootstrap` 不再直接调用 `ProjectMLayer.loadPresetFromUrl(...)`）。
-- 验收推荐走：`npm run verify:dev`（会产出 `newliveweb/artifacts/headless/*` 并输出 Summary；`diff.png`/`viz-canvas-a/b.png` 用于直观看变化，不要只看 `screenshot.png`）。
+## 📁 开源结构
 
-## 技术栈
+```
+newliveweb/
+├── src/                    # TypeScript 核心源码
+│   ├── audio/              # 音频分析模块
+│   ├── features/           # 特征提取
+│   ├── layers/             # 渲染层
+│   ├── projectm/           # ProjectM 集成
+│   ├── ui/                 # 用户界面
+│   └── utils/              # 工具函数
+├── python/                 # Python 训练程序
+│   ├── preset_quality_trainer.py  # 质量训练
+│   └── ...                 # 其他脚本
+├── docs/                   # 项目文档
+├── wasm/                   # WebAssembly 模块
+├── public/                 # 静态资源
+├── tests/                  # 测试文件
+├── LICENSE                 # GPL-3.0 协议
+└── README.md               # 本文件
+```
 
-- Vite + TypeScript
-- Three.js（Layer 管线 + ShaderMaterial）
-- Web Audio API（`AudioBus` + `StreamAudioProcessor`）
-- ProjectM WASM（`public/projectm-runtime/projectm.{js,wasm}`）
+## ⚠️ 不包含内容
 
-## 开发
+- **预设包 (presets/)** - 版权内容，不开源
+- **音乐文件** - 版权内容，不开源
+- **第三方 API 密钥** - 安全考虑，不上传
+- **node_modules/** - 依赖安装后不提交
+
+## 🚀 快速开始
 
 ```bash
+# 克隆仓库
+git clone https://github.com/yourusername/newliveweb.git
 cd newliveweb
-npm install
-npm run dev   # 默认 5173/5174 端口，终端会提示实际端口
 
-# 生产构建
+# 安装依赖
+npm install
+
+# 开发模式
+npm run dev
+
+# 构建
 npm run build
+
+# 运行测试
+npm run test
 ```
 
-### Windows 快速启动（推荐）
+## 📦 开源依赖来源
 
-```powershell
-cd C:\Users\pc\code\newliveweb
-npm install
-npm run dev -- --host 127.0.0.1 --port 5174 --strictPort
+本项目使用以下开源组件，感谢各位开发者：
+
+### 核心依赖
+
+| 组件 | 版本 | 用途 | 协议 |
+|------|------|------|------|
+| **ProjectM** | latest | 音乐视觉化渲染引擎 | GPL-2.0 |
+| **Vite** | latest | 构建工具 | MIT |
+| **TypeScript** | latest | 类型安全开发 | Apache-2.0 |
+| **Node.js** | latest | 运行时环境 | MIT |
+
+### 音频处理
+
+| 组件 | 用途 | 协议 |
+|------|------|------|
+| **Web Audio API** | 浏览器音频分析 | W3C License |
+| **Essentia.js** | 音频特征提取 | BSD-3-Clause |
+
+### 测试工具
+
+| 组件 | 用途 | 协议 |
+|------|------|------|
+| **Vitest** | 单元测试 | MIT |
+| **Playwright** | E2E 测试 | Apache-2.0 |
+
+## 🤝 贡献指南
+
+欢迎贡献代码！
+
+1. Fork 本仓库
+2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
+3. 提交变更 (`git commit -m 'Add some AmazingFeature'`)
+4. 推送到分支 (`git push origin feature/AmazingFeature`)
+5. 开启 Pull Request
+
+## 📄 开源协议
+
+本项目采用 **GPL-3.0** 开源协议：
+
+```
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 ```
 
-### 快速验收（推荐）
+**协议要点**：
+- ✅ 自由使用、修改、分发
+- ✅ 商业使用允许
+- ⚠️ 修改后必须开源
+- ⚠️ 必须保留版权声明
 
-```bash
-npm run verify:dev
-```
+## 📞 联系
 
-## 当前状态
+- GitHub Issues: 功能建议、Bug 报告
+- 邮箱: your-email@example.com
 
-- ✅ Layer 架构：`SceneManager` + `Layer` 接口，支持动态添加/销毁图层。
-- ✅ LiquidMetalLayer：新版 ShaderMaterial，响应时间与鼠标，运行在主 Canvas。
-- ✅ ProjectMLayer：封装 `ProjectMEngine`（加载 `/projectm-runtime/projectm.{js,wasm}`），默认 preset `public/presets/default.milk`，以 CanvasTexture + AdditiveBlending 覆盖 LiquidMetal。
-- ✅ 音频管线：以 `src/audio/AudioBus.ts` 为主入口（内部包含分析/分发），支持本地文件与 URL；统一输出 `AudioFrame` 驱动 LiquidMetal，并把 PCM 推送到 ProjectM。
-- ✅ Preset 管理：工具栏支持预设下拉、`.milk` 导入、远程 URL 加载 & 自动轮播，底层由 `src/config/presets.ts` 管理内置清单（默认提供 Default / martin Liquid Gold / Geiss Starfish 1）。
-- ✅ 资源地址预填：UI 会显示“测试音乐目录/预设包目录”的标签（来源于 `src/config/paths.ts`），便于按你的本机路径进行同步或替换。
+## 🙏 致谢
 
-## 音频控制
-
-- 工具栏包含「Load audio」按钮（本地文件）和 URL 输入（外部流 / HLS/mp3）。
-- 选择或加载后自动开始播放，可用 Play/Pause 切换、Volume 滑块调节音量。
-- 右侧实时显示播放进度与当前音源状态；若加载失败会提示错误。
-- 所有音频解码都发生在浏览器端，OBS 只需捕获最终 Canvas 图层。
-
-## ProjectM 预设控制
-
-- 工具栏第二行用于管理 ProjectM 预设：
-  - 下拉框：列出 `src/config/presets.ts` 中定义的内置预设；选择后立即热加载。
-  - Import `.milk`：从本地上传任意 MilkDrop 预设文本，实时替换当前效果。
-  - Load URL：输入远程 `.milk` 链接（支持同源或可跨域文件），点击加载即可应用。
-- Next preset：手动切换到下一条内置预设，方便表演/演示快速轮播。
-- Auto-cycle + Interval：勾选后按照设定秒数自动轮播内置预设；加载自定义文件/URL 会自动退出轮播，确保舞台可控。
-- 想要扩展内置列表时，把 `.milk` 文件放在 `public/presets/` 并在 `src/config/presets.ts` 注册即可。
-- 所有操作都在浏览器端完成，无需刷新页面即可切换预设。
-
-## 目录提示
-
-- `public/projectm-runtime/`：ProjectM WASM 资产（从旧项目复制但在这里独立维护）。
-- `public/presets/*.milk`：默认启动的 `default.milk` 以及新增展示用 `martin-liquid-gold.milk`、`geiss-starfish-1.milk`。
-- `src/config/presets.ts`：内置预设清单 & 查找辅助函数。
-- `src/config/paths.ts`：集中定义测试音乐/预设资源的绝对路径。
-- `public/presets/library-manifest.json`：`sync:presets` 脚本生成的动态预设清单，供 UI 自动加载。
-
-## 运行时兼容性
-
-- 2025-12-11：`public/projectm-runtime/projectm.js` 手动移除了所有 `import.meta.url` 依赖（共两处），改为：
-
-  1. `_scriptName` 初始化：使用 `document.currentScript.src` 或 `self.location.href` 推导脚本路径
-  2. `wasmBase` 计算：改用 `_scriptName` 通过 `new URL()` 构建 WASM 基准路径，回退到 `"./"`
-
-  这样可避免在 Vite 动态注入或经典 `<script>` 环境里触发 `Cannot use 'import.meta' outside a module`。未来若重新生成该文件，请重新套用同样的 shim。
-
-## 资源同步（MilkDrop MegaPack）
-
-> 来源：`/Users/masher/code/MilkDrop 130k+ Presets MegaPack 2025 2`（见附件 README / PRESET LICENSE）。
-
-- 运行脚本，把 MegaPack 中的 `.milk` 拷贝到 `public/presets/mega/**` 并生成清单：
-
-```bash
-cd newliveweb
-npm run sync:presets -- --limit=200
-```
-
-- 参数说明：
-  - `--source=/absolute/path` 可覆盖默认打包目录。
-  - `--limit=200` 控制拷贝数量，防止一次性复制 13 万个文件。
-  - `--target=mega` 可切换输出子目录名。
-- 运行完成后 `public/presets/library-manifest.json` 会记录生成时间、来源路径与每个拷贝的 URL，前端会自动加载清单并追加到 UI 下拉列表，同时支持自动轮播。
-- 请遵守 `MilkDrop 130k+ Presets MegaPack` 的授权要求（大部分基于 CC-BY-NC-SA 3.0；详见 `PRESET LICENSE.txt`）。
-- `src/layers/`：所有可组合图层（LiquidMetal、ProjectM、未来的效果层）。
-
-欢迎直接在该目录继续开发，旧 `projectm-web-visualizer/` 不再接受新代码。
+- [ProjectM](https://github.com/projectm/projectm) - 视觉化引擎
+- [Vite](https://github.com/vitejs/vite) - 构建工具
+- [TypeScript](https://github.com/microsoft/TypeScript) - 开发语言
+- 所有开源社区贡献者
 
 ---
 
-## 维护提示（避免踩坑）
-
-- 文档权威入口是 `MASTER_SPEC.zh.md`；其余文档以“只追加”为原则做专题补充。
-- 不要在 Layer 内触碰 DOM/localStorage；UI/业务逻辑统一在 `app/*` 或 `features/*`。
-- 如果出现“没音频/不动/色偏”，优先看 Diagnostics 面板与 `artifacts/headless/*`，不要靠主观观感争论。
+**注意**: 这是一个开发中的项目，API 可能会变更。
