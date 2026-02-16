@@ -207,10 +207,75 @@ npm run verify:dev
 - root-migration 审计/迁移/实施的旧报告、旧清单、旧白皮书、旧 runbook（以及 local 临时执行记录）。
 - 若需要进一步拆分，可在本节下新增子锚点，但保留本锚点作为总入口。
 
-**现行事实（命令/门禁/证据链）**：
-- verify:dev / verify:check：见 [SSOT 第 4 章](#4-门禁与验证)
-- coupled pipeline：见 [SSOT 第 5 章](#5-coupled-quality-pipeline)
-- runtime 关键文件：见 [SSOT 第 6 章](#6-runtime-选择逻辑)
+**现行事实（黄金命令/门禁/证据链）**：
+
+#### ① verify:dev（开发验证）
+```bash
+npm run verify:dev
+```
+- **目的**：快速验证开发环境，检查 WebGL/GPU、音频活性、JSON 产物
+- **产物路径**：`artifacts/verify-dev/latest/`
+  - `verify.log` - 完整日志
+  - `meta.json` - 运行时常数（含 `webgl.renderer`）
+- **失败时看哪里**：
+  - `meta.json` 中 `runtime.webgl.renderer` 含 "SwiftShader" → GPU 回退，执行 `scripts/kill-stale-headless-browsers.ps1` 后重试
+  - `audioRms: 0` → 音频静音，检查 `AudioBus.ts` 初始化
+
+#### ② verify:check（严格门禁）
+```bash
+npm run verify:check
+```
+- **目的**：CI/CD 门禁，比 verify:dev 更严格的阈值
+- **产物路径**：`artifacts/verify-check/latest/`
+- **失败时看哪里**：
+  - Exit code ≠ 0 → 看 `verify.log` 中 ERROR 行
+  - Missing `pairs-quality.v0.json` → 执行 coupled pipeline 生成
+
+#### ③ headless-eval-coupled-pairs（离线评估）
+```bash
+node scripts/headless-eval-coupled-pairs.mjs --resume
+```
+- **目的**：离线评估 fg/bg 配对质量，产出质量评分
+- **产物路径**：`artifacts/coupled-eval/<timestamp>/`
+  - `eval.jsonl` - 逐对评估记录
+  - `meta.json` - 运行时证据（WebGL renderer、audioRms）
+  - `checkpoint.json` - 断点（支持 `--resume`）
+- **失败时看哪里**：
+  - `webgl.renderer` = "SwiftShader" →  headed 模式更可靠
+  - `audioRms: 0` → 检查 `--mute-audio=false` 参数
+  - 进程卡住 → `scripts/kill-stale-headless-browsers.ps1`
+
+#### ④ run-coupled-quality-overnight（一键过夜）
+```powershell
+.\scripts\run-coupled-quality-overnight.ps1 -TargetCoverage 0.95
+```
+- **目的**：sync → eval → train → verify 全自动过夜流程
+- **产物路径**：
+  - 评估：`artifacts/coupled-eval/<stamp>/`
+  - 训练：`public/presets/<pack>/pairs-quality.v0.json`
+  - 验证：`artifacts/verify-dev/latest/`
+- **失败时看哪里**：
+  - Sync 失败 → 检查 `D:aidata` 路径可访问
+  - Eval 失败 → 看 `artifacts/coupled-eval/<stamp>/vite.log`
+  - Train 失败 → 检查 `python/unified_coupling_trainer.py` 日志
+  - Verify 失败 → 见本节 ①/②
+
+#### ⑤ train-coupled-quality（训练）
+```powershell
+.\scripts\train-coupled-quality.ps1
+```
+- **目的**：基于评估结果训练质量模型，产出 `pairs-quality.v0.json`
+- **产物路径**：`public/presets/<pack>/pairs-quality.v0.json`
+- **失败时看哪里**：
+  - `min-quality-std` 门禁未通过 → 检查训练数据分布
+  - 模型不收敛 → 调整 `performanceThresholds.ts` 阈值
+
+#### ⑥ runtime 关键文件速查
+- **URL 开关/verify hooks**：`src/app/bootstrap.ts`
+- **质量 JSON 加载**：`src/features/presets/coupledPairsLoader.ts`
+- **数据 schema**：`src/features/presets/coupledPairsStore.ts`
+- **质量计算**：`src/features/presets/presetQuality.ts`
+- **音频管线/活性检测**：`src/audio/AudioBus.ts`
 
 ### <a id="deprecated-optimization-complete"></a> deprecated-optimization-complete
 
