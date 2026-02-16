@@ -1,0 +1,496 @@
+{
+  "version": 1,
+  "meta": {
+    "name": "Techno Control Panel",
+    "style": "Ableton-like",
+    "updated": "2026-01-05"
+  },
+  "macroDefaults": [
+    { "macro": 1, "paramId": "reactivity" },
+    { "macro": 2, "paramId": "motion" },
+    { "macro": 3, "paramId": "brightnessMin" },
+    { "macro": 4, "paramId": "brightnessMax" },
+    { "macro": 5, "paramId": "captureDensity" },
+    { "macro": 6, "paramId": "overlayMix" },
+    { "macro": 7, "paramId": "overlayDepthPx" },
+    { "macro": 8, "paramId": "timeScale" }
+  ],
+  "groups": [
+    {
+      "id": "performance",
+      "label": "Performance",
+      "collapsedByDefault": false,
+      "params": [
+        {
+          "id": "mode",
+          "label": "Mode",
+          "type": "enum",
+          "options": ["Techno", "Fusion", "Capture"],
+          "default": "Techno"
+        },
+        {
+          "id": "reactivity",
+          "label": "Reactivity",
+          "type": "float",
+          "min": 0.5,
+          "max": 2.0,
+          "default": 1.2,
+          "unit": "x",
+          "mapsTo": ["audioKickBoost", "audioBassBoost"]
+        },
+        {
+          "id": "motion",
+          "label": "Motion",
+          "type": "float",
+          "min": 0.8,
+          "max": 1.6,
+          "default": 1.1,
+          "unit": "x",
+          "mapsTo": ["timeScale"]
+        },
+        {
+          "id": "brightnessMin",
+          "label": "Brightness Min",
+          "type": "float",
+          "min": 0.0,
+          "max": 1.0,
+          "default": 0.02,
+          "mapsTo": ["frameLumaMin"]
+        },
+        {
+          "id": "brightnessMax",
+          "label": "Brightness Max",
+          "type": "float",
+          "min": 0.0,
+          "max": 1.0,
+          "default": 0.9,
+          "mapsTo": ["frameLumaMax"]
+        },
+        {
+          "id": "captureDensity",
+          "label": "Capture Density",
+          "type": "int",
+          "min": 1,
+          "max": 6,
+          "default": 4,
+          "mapsTo": ["captureCount"]
+        }
+      ]
+    },
+    {
+      "id": "audio",
+      "label": "Audio Reactivity",
+      "collapsedByDefault": false,
+      "params": [
+        {
+          "id": "bpmMode",
+          "label": "BPM Mode",
+          "type": "enum",
+          "options": ["Fixed", "Range"],
+          "default": "Range"
+        },
+        {
+          "id": "audioBpm",
+          "label": "BPM",
+          "type": "int",
+          "min": 60,
+          "max": 200,
+          "default": 132,
+          "unit": "bpm"
+        },
+        {
+          "id": "audioBpmMin",
+          "label": "BPM Min",
+          "type": "int",
+          "min": 90,
+          "max": 200,
+          "default": 122,
+          "unit": "bpm"
+        },
+        {
+          "id": "audioBpmMax",
+          "label": "BPM Max",
+          "type": "int",
+          "min": 90,
+          "max": 200,
+          "default": 145,
+          "unit": "bpm"
+        },
+        {
+          "id": "audioSwing",
+          "label": "Swing",
+          "type": "float",
+          "min": 0.0,
+          "max": 0.25,
+          "default": 0.08
+        },
+        {
+          "id": "audioKickBoost",
+          "label": "Kick Boost",
+          "type": "float",
+          "min": 0.6,
+          "max": 2.5,
+          "default": 1.6
+        },
+        {
+          "id": "audioBassBoost",
+          "label": "Bass Boost",
+          "type": "float",
+          "min": 0.5,
+          "max": 2.0,
+          "default": 1.4
+        },
+        {
+          "id": "audioHatBoost",
+          "label": "Hat Boost",
+          "type": "float",
+          "min": 0.4,
+          "max": 2.0,
+          "default": 1.2
+        },
+        {
+          "id": "audioClapBoost",
+          "label": "Clap Boost",
+          "type": "float",
+          "min": 0.4,
+          "max": 2.0,
+          "default": 1.0
+        },
+        {
+          "id": "audioSeed",
+          "label": "Audio Seed",
+          "type": "int",
+          "min": 0,
+          "max": 2147483647,
+          "default": 0,
+          "note": "0 means use presetSeed"
+        }
+      ]
+    },
+    {
+      "id": "fft",
+      "label": "FFT / Spectrum",
+      "collapsedByDefault": true,
+      "params": [
+        {
+          "id": "fftEnable",
+          "label": "FFT Enable",
+          "type": "bool",
+          "default": false
+        },
+        {
+          "id": "fftSmooth",
+          "label": "FFT Smooth",
+          "type": "float",
+          "min": 0.0,
+          "max": 1.0,
+          "default": 0.6
+        },
+        {
+          "id": "fftWeightLow",
+          "label": "Band Weight Low",
+          "type": "float",
+          "min": 0.0,
+          "max": 2.0,
+          "default": 1.0
+        },
+        {
+          "id": "fftWeightMid",
+          "label": "Band Weight Mid",
+          "type": "float",
+          "min": 0.0,
+          "max": 2.0,
+          "default": 0.8
+        },
+        {
+          "id": "fftWeightHigh",
+          "label": "Band Weight High",
+          "type": "float",
+          "min": 0.0,
+          "max": 2.0,
+          "default": 0.6
+        },
+        {
+          "id": "fftToOverlayDepth",
+          "label": "FFT -> Overlay Depth",
+          "type": "float",
+          "min": 0.0,
+          "max": 1.0,
+          "default": 0.7
+        },
+        {
+          "id": "fftToOverlayMix",
+          "label": "FFT -> Overlay Mix",
+          "type": "float",
+          "min": 0.0,
+          "max": 1.0,
+          "default": 0.5
+        },
+        {
+          "id": "fftToFramePickBias",
+          "label": "FFT -> Frame Pick Bias",
+          "type": "float",
+          "min": 0.0,
+          "max": 1.0,
+          "default": 0.5
+        }
+      ]
+    },
+    {
+      "id": "overlay",
+      "label": "Fusion / Overlay",
+      "collapsedByDefault": true,
+      "params": [
+        {
+          "id": "overlayMode",
+          "label": "Overlay Mode",
+          "type": "enum",
+          "options": ["none", "parallax"],
+          "default": "none"
+        },
+        {
+          "id": "overlayBlend",
+          "label": "Overlay Blend",
+          "type": "enum",
+          "options": ["screen", "add", "overlay", "multiply"],
+          "default": "screen"
+        },
+        {
+          "id": "overlayMix",
+          "label": "Overlay Mix",
+          "type": "float",
+          "min": 0.0,
+          "max": 1.0,
+          "default": 0.55
+        },
+        {
+          "id": "overlayDepthPx",
+          "label": "Overlay Depth Px",
+          "type": "int",
+          "min": 0,
+          "max": 128,
+          "default": 14
+        },
+        {
+          "id": "overlayScale",
+          "label": "Overlay Scale",
+          "type": "float",
+          "min": 0.0,
+          "max": 0.25,
+          "default": 0.06
+        },
+        {
+          "id": "overlaySeed",
+          "label": "Overlay Seed",
+          "type": "int",
+          "min": 0,
+          "max": 2147483647,
+          "default": 202501
+        },
+        {
+          "id": "overlaySource",
+          "label": "Overlay Source",
+          "type": "string",
+          "default": "same-pack"
+        }
+      ]
+    },
+    {
+      "id": "capture",
+      "label": "Capture / Render",
+      "collapsedByDefault": true,
+      "params": [
+        {
+          "id": "warmupFrames",
+          "label": "Warmup Frames",
+          "type": "int",
+          "min": 0,
+          "max": 300,
+          "default": 120
+        },
+        {
+          "id": "captureEvery",
+          "label": "Capture Every",
+          "type": "int",
+          "min": 10,
+          "max": 120,
+          "default": 60
+        },
+        {
+          "id": "captureMaxFrames",
+          "label": "Capture Max Frames",
+          "type": "int",
+          "min": 3,
+          "max": 12,
+          "default": 8
+        },
+        {
+          "id": "outSize",
+          "label": "Out Size",
+          "type": "int",
+          "min": 128,
+          "max": 512,
+          "default": 224,
+          "unit": "px"
+        },
+        {
+          "id": "format",
+          "label": "Format",
+          "type": "enum",
+          "options": ["webp", "png"],
+          "default": "webp"
+        },
+        {
+          "id": "webpQuality",
+          "label": "WebP Quality",
+          "type": "float",
+          "min": 0.6,
+          "max": 1.0,
+          "default": 0.92
+        }
+      ]
+    },
+    {
+      "id": "reliability",
+      "label": "Reliability",
+      "collapsedByDefault": true,
+      "params": [
+        {
+          "id": "timeoutMs",
+          "label": "Timeout Ms",
+          "type": "int",
+          "min": 5000,
+          "max": 90000,
+          "default": 45000
+        },
+        {
+          "id": "prewarmTimeoutMs",
+          "label": "Prewarm Timeout Ms",
+          "type": "int",
+          "min": 30000,
+          "max": 180000,
+          "default": 120000
+        },
+        {
+          "id": "retryTimes",
+          "label": "Retry Times",
+          "type": "int",
+          "min": 0,
+          "max": 6,
+          "default": 3
+        },
+        {
+          "id": "refreshEvery",
+          "label": "Refresh Every",
+          "type": "int",
+          "min": 20,
+          "max": 150,
+          "default": 90
+        }
+      ]
+    },
+    {
+      "id": "output",
+      "label": "Output / Storage",
+      "collapsedByDefault": true,
+      "params": [
+        {
+          "id": "outDir",
+          "label": "OutDir",
+          "type": "string",
+          "default": "D:\\\\aidata\\\\..."
+        },
+        {
+          "id": "uploadRoot",
+          "label": "Upload Root",
+          "type": "string",
+          "default": "Z:\\\\code\\\\aidata"
+        },
+        {
+          "id": "uploadAfterJob",
+          "label": "Upload After Job",
+          "type": "bool",
+          "default": true
+        },
+        {
+          "id": "skipPost",
+          "label": "Skip Post",
+          "type": "bool",
+          "default": false
+        }
+      ]
+    },
+    {
+      "id": "advanced",
+      "label": "Advanced / Debug",
+      "collapsedByDefault": true,
+      "params": [
+        {
+          "id": "timeMode",
+          "label": "timeMode",
+          "type": "enum",
+          "options": ["fixedStep", "realtime"],
+          "default": "fixedStep"
+        },
+        {
+          "id": "fixedStepFps",
+          "label": "fixedStepFps",
+          "type": "int",
+          "min": 1,
+          "max": 120,
+          "default": 30
+        },
+        {
+          "id": "forceNewWasmModule",
+          "label": "forceNewWasmModule",
+          "type": "bool",
+          "default": false
+        },
+        {
+          "id": "headless",
+          "label": "headless",
+          "type": "bool",
+          "default": true
+        },
+        {
+          "id": "logEvery",
+          "label": "logEvery",
+          "type": "int",
+          "min": 10,
+          "max": 50,
+          "default": 25
+        }
+      ]
+    },
+    {
+      "id": "ui",
+      "label": "UI / Layout",
+      "collapsedByDefault": true,
+      "params": [
+        {
+          "id": "collapseAll",
+          "label": "Collapse All",
+          "type": "action"
+        },
+        {
+          "id": "expandAll",
+          "label": "Expand All",
+          "type": "action"
+        },
+        {
+          "id": "showAdvancedByDefault",
+          "label": "Show Advanced By Default",
+          "type": "bool",
+          "default": false
+        },
+        {
+          "id": "macroRowHeight",
+          "label": "Macro Row Height",
+          "type": "enum",
+          "options": ["small", "medium", "large"],
+          "default": "medium"
+        }
+      ]
+    }
+  ]
+}

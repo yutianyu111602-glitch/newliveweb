@@ -41,6 +41,7 @@
   - Notes: 需在 macOS/Chrome/Safari 现场验证权限与 secure context；未授权前设备 label 为空属于正常现象
 
 - AI: GPT-5.2 (Codex)
+
   - Scope: B) camera/video 背景护栏 + 状态可见性 + 移除遗留直写入口
   - Files:
     - src/layers/VideoLayer.ts
@@ -53,7 +54,7 @@
   - Notes: `npm run verify:headless` 不会自动起 dev server，验收请用 `verify:dev`
 
 - AI: GPT-5.2 (Codex)
-  - Scope: C) 演出模式一键配置（Show config）+ MIDI bindings UX + Video 用户手势重试
+  - Scope: C) MIDI bindings UX + Video 用户手势重试
   - Files:
     - src/app/renderShell.ts
     - src/app/bootstrap.ts
@@ -62,5 +63,4 @@
     - DATA_INTERFACES.zh.md
     - MASTER_SPEC.zh.md
     - TODOS.zh.md
-  - Done signal: `Save show` 写入 `newliveweb:showConfig:v1`，`Show` 可恢复音频偏好 + `VisualStateV2`；工具栏显示 `Bindings: N` 且支持 `Clear`；Video autoplay 被拒时可点 `Retry video` 手动重试
-  - Notes: `Show` 按钮被加入“首个手势不自动加载测试音轨”的白名单（避免误触发 Track 自动加载）
+  - Done signal: 工具栏显示 `Bindings: N` 且支持 `Clear`；Video autoplay 被拒时可点 `Retry video` 手动重试

@@ -189,14 +189,13 @@ Layer 消费点：
   - 更新 `background.layers.<layer>`
   - 如果该层是当前 `background.type`，同时更新 `background.params` 镜像（兼容路径）
 
-### 4.3 恢复（Favorite/Show）→ 写回 UI + Layer
+### 4.3 恢复（Favorite）→ 写回 UI + Layer
 
 - `applyVisualStateSnapshot()`：`src/app/bootstrap.ts:2116`
 
 ### 4.4 storage keys
 
 - Favorites：`newliveweb:favorites:v2`（`src/app/bootstrap.ts:1125`）
-- Show：`newliveweb:showConfig:v1`（`src/app/bootstrap.ts:2289`）
 - MIDI：`newliveweb:settings:v1`（`src/features/settings/settingsStore.ts:25`）
 
 ---

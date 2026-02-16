@@ -16,12 +16,12 @@
 ## 1. 关键事实（以代码为准）
 
 - 已落地：
+
   - `AudioBus` 输出 `AudioFrame`（含 `energy` 与 `energyRaw?`），可 URL opt-in EMA 平滑（`?audioSmoothing=ema&audioSmoothingAlpha=0.2`）。
   - 本地输入设备捕获：`AudioBus.loadInputDevice(deviceId?)`（`getUserMedia({ audio })` → `MediaStreamAudioSourceNode`），工具栏 `Input` + `Use input` 可切换到输入源，默认音量 0 防反馈。
   - Background：`liquid/camera/video` 类型存在；`BackgroundRegistry` 负责互斥启用与 params 过滤。
   - `CameraLayer` / `VideoLayer` 已实现（含最小护栏与状态可见性：拒权回退/短提示/Diagnostics bgStatus）。
   - `VisualStateV2`、`ParamSchema`、`VisualStateController.applyPatch`、Inspector/Random/Favorite 已形成闭环（但仍需治理遗留直写入口）。
-  - 演出模式一键配置：`Save show`/`Show`（localStorage：`newliveweb:showConfig:v1`）保存并恢复音频偏好 + `VisualStateV2`。
   - MIDI bindings UX：显示 `Bindings: N`，支持 `Clear` 清空；存储于 `newliveweb:settings:v1`（仅 `midi.bindings`，不进入 Favorites）。
   - Video autoplay 被拒时：工具栏 `Retry video` 支持用户手势重试。
 
