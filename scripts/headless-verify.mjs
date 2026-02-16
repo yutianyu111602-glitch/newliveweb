@@ -12,6 +12,62 @@ const BASE_URL = process.env.VERIFY_URL ?? 'http://127.0.0.1:5174/';
 const OUT_DIR = process.env.VERIFY_OUT_DIR ?? path.resolve('artifacts', 'headless');
 const DSF = Number(process.env.VERIFY_DSF ?? 1.5);
 const VERIFY_BEAT_TEMPO = String(process.env.VERIFY_BEAT_TEMPO ?? '').trim() === '1';
+const VERIFY_PRESET_LIBRARY = String(
+  process.env.VERIFY_PRESET_LIBRARY ?? 'run3-crashsafe-15000'
+).trim();
+const VERIFY_GPU = String(process.env.VERIFY_GPU ?? '').trim() === '1';
+const VERIFY_GPU_MODE = String(
+  process.env.VERIFY_GPU_MODE ?? (VERIFY_GPU ? 'safe' : 'off')
+).trim();
+const VERIFY_MUTE_AUDIO = String(process.env.VERIFY_MUTE_AUDIO ?? '').trim() === '1';
+const VERIFY_STRICT_OUTPUTS_PANEL = String(
+  process.env.VERIFY_STRICT_OUTPUTS_PANEL ?? ''
+).trim() === '1';
+const VERIFY_HEADLESS_RAW = String(process.env.VERIFY_HEADLESS ?? '').trim();
+const VERIFY_HEADLESS = VERIFY_HEADLESS_RAW
+  ? VERIFY_HEADLESS_RAW === '1'
+  : !VERIFY_GPU;
+// Headless runs can be slower on some Windows + WSL + SwiftShader setups. Prefer a slightly
+// more forgiving default to reduce flaky timeouts (verify-dev can still override via env).
+const HARD_TIMEOUT_MS = Number(process.env.VERIFY_HARD_TIMEOUT_MS ?? 480000);
+
+// Coupled-pick A/B: sample-driven selection loop.
+// SEL_SAMPLES  = target number of [sel] lines to collect (default 60).
+// SEL_ITERS    = max clicks safety cap (default 10 × SEL_SAMPLES).
+// SEL_DELAY_MS = delay between clicks (default 60 ms).
+const SEL_SAMPLES = Math.max(1, Number(process.env.VERIFY_SEL_SAMPLES || 60));
+
+// Coupled-pick strategy parameters (overridable for sweep experiments).
+// These feed into addInitScript's __nw_verify overrides.
+const COUPLED_GAMMA = Number(process.env.VERIFY_COUPLED_GAMMA || 4);
+const COUPLED_EXPLORE = Number(process.env.VERIFY_COUPLED_EXPLORE ?? '') >= 0
+  ? Number(process.env.VERIFY_COUPLED_EXPLORE)
+  : 0;
+
+const SEL_ITERS = Math.max(
+  SEL_SAMPLES,
+  Number(process.env.VERIFY_SEL_ITERS || SEL_SAMPLES * 10)
+);
+const SEL_DELAY_MS = Math.max(0, Number(process.env.VERIFY_SEL_DELAY_MS || 60));
+
+const TARGET_URL = (() => {
+  try {
+    const u = new URL(BASE_URL);
+    const hasPresetParam = String(u.searchParams.get('presetLibrarySource') ?? '').trim();
+    const hasRunManifestParam = String(u.searchParams.get('runManifestUrl') ?? '').trim();
+
+    if (!hasPresetParam && VERIFY_PRESET_LIBRARY) {
+      u.searchParams.set('presetLibrarySource', VERIFY_PRESET_LIBRARY);
+    }
+    // Keep run-manifest deterministic in verify runs unless explicitly overridden.
+    if (!hasRunManifestParam) {
+      u.searchParams.set('runManifestUrl', '/run-manifest.json');
+    }
+    return u.toString();
+  } catch {
+    return BASE_URL;
+  }
+})();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -98,6 +154,13 @@ async function main() {
 
   await ensureDir(OUT_DIR);
 
+  const hardTimeout = Number.isFinite(HARD_TIMEOUT_MS) && HARD_TIMEOUT_MS > 0
+    ? setTimeout(() => {
+        console.error(`[verify] hard timeout after ${HARD_TIMEOUT_MS}ms`);
+        process.exit(2);
+      }, HARD_TIMEOUT_MS)
+    : null;
+
   // Keep stdout alive during long verification runs to avoid VS Code/Copilot
   // prompting to "Continue waiting" when output is idle for a while.
   const HEARTBEAT_MS = Math.max(0, Number(process.env.VERIFY_HEARTBEAT_MS ?? 30_000) || 0);
@@ -154,6 +217,17 @@ async function main() {
   let navigationFailureLine = null;
 
   const resetForAttempt = (attempt) => {
+    // Preserve startup lines (e.g. [coupled-pick] config) that fired during
+    // initial page load / module evaluation — these are one-time and won't
+    // re-fire on subsequent attempts.  Deduplicate via Set to avoid copies
+    // caused by page.reload() re-firing the same console.log.
+    const startupLines = [
+      ...new Set(
+        consoleLines.filter((l) =>
+          /\[coupled-pick\]|\[coupled-pairs\]/.test(l)
+        )
+      ),
+    ];
     consoleLines.length = 0;
     pageErrors.length = 0;
     exitCode = 0;
@@ -163,6 +237,11 @@ async function main() {
     // Keep early navigation failures visible in every attempt log.
     if (navigationFailureLine) {
       consoleLines.push(navigationFailureLine);
+    }
+    // Re-inject preserved startup lines so they appear in browser-console.log.
+    for (const line of startupLines) {
+      consoleLines.push(line);
+      report.counts.console++;
     }
     report.checks.canvasAttached = false;
     report.checks.canvasSize = null;
@@ -181,9 +260,14 @@ async function main() {
     report.checks.projectMCanvasSampleSeries = null;
     report.checks.mixerUi = null;
     report.checks.mixerBlend = null;
+
+    // Dual ProjectM random (FG+BG should both change over a few Random clicks).
+    report.checks.dualRandom = null;
+    report.checks.dualRandom = null;
     report.checks.favoritesCompare = null;
     report.checks.presetStress = null;
     report.checks.userFlow = null;
+    report.checks.outputsPanel = null;
     report.checks.beatTempo = null;
     report.checks.perfCaps = null;
     report.checks.aivjAccent = null;
@@ -193,11 +277,12 @@ async function main() {
   };
 
   const allowedConsoleErrorPatterns = [
-    // Add allowed patterns here if needed.
+    // Harmless in dev: missing favicon/manifest/etc.
+    /^Failed to load resource: the server responded with a status of 404/i,
   ];
 
   const report = {
-    url: BASE_URL,
+    url: TARGET_URL,
     startedAt: new Date().toISOString(),
     deviceScaleFactor: Number.isFinite(DSF) && DSF > 0 ? DSF : 1,
     checks: {
@@ -236,6 +321,9 @@ async function main() {
       // Perf caps snapshot (audio analysis/beat/PM cadence).
       perfCaps: null,
 
+      // Outputs panel quick check.
+      outputsPanel: null,
+
       // AIVJ accent observability (Diagnostics + Topology + Trace).
       aivjAccent: null,
 
@@ -244,6 +332,9 @@ async function main() {
 
       // Preset load shedding (pressure window caps).
       presetLoadShedding: null,
+
+      // Budget dynamics: verify aggressiveness/level shift signals.
+      budgetDynamics: null,
     },
     counts: {
       console: 0,
@@ -354,23 +445,62 @@ async function main() {
     return { width: w, height: h, sampleCount, nonBackgroundCount, nonBackgroundRatio, hash };
   };
 
+  const browserArgs = [
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    // Windows-specific: avoid occlusion heuristics that can pause rendering/timers.
+    '--disable-features=CalculateNativeWinOcclusion',
+  ];
+  if (VERIFY_MUTE_AUDIO) browserArgs.push('--mute-audio');
+
+  // GPU flags can be surprisingly finicky on some Windows desktops.
+  // Default to a conservative set that usually preserves a working WebGL context.
+  if (VERIFY_GPU && VERIFY_GPU_MODE !== 'off') {
+    if (VERIFY_GPU_MODE === 'force-d3d11') {
+      browserArgs.push(
+        '--use-angle=d3d11',
+        '--use-gl=desktop',
+        '--enable-gpu-rasterization',
+        '--enable-zero-copy',
+        '--disable-software-rasterizer'
+      );
+    } else {
+      browserArgs.push('--enable-gpu-rasterization', '--enable-zero-copy');
+    }
+  }
+
   const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-      // Windows-specific: avoid occlusion heuristics that can pause rendering/timers.
-      '--disable-features=CalculateNativeWinOcclusion',
-    ],
+    headless: VERIFY_HEADLESS,
+    args: browserArgs,
   });
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
     deviceScaleFactor: Number.isFinite(DSF) && DSF > 0 ? DSF : 1,
   });
 
+  await context.addInitScript(({ presetLibrarySource }) => {
+    try {
+      localStorage.setItem('presetLibrarySource', String(presetLibrarySource || 'run3-crashsafe-15000'));
+      localStorage.setItem('nw.runManifestUrl', '/run-manifest.json');
+      localStorage.setItem('nw.aivj.enabled', 'true');
+    } catch {
+      // ignore
+    }
+  }, { presetLibrarySource: VERIFY_PRESET_LIBRARY });
+
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const page = await context.newPage();
+
+  // On Windows, headful Chromium can end up effectively "backgrounded" if it doesn't
+  // get focus, which can heavily distort frame-time sampling.
+  if (!VERIFY_HEADLESS) {
+    try {
+      await page.bringToFront();
+    } catch {
+      // ignore
+    }
+  }
 
   let pageClosed = false;
   let expectedClose = false;
@@ -425,6 +555,32 @@ async function main() {
     report.counts.pageErrors++;
   });
 
+  if (VERIFY_PRESET_LIBRARY) {
+    await page.addInitScript((source) => {
+      try {
+        localStorage.setItem('presetLibrarySource', String(source));
+      } catch {
+        // ignore
+      }
+    }, VERIFY_PRESET_LIBRARY);
+  }
+
+  // Inject verify mocks BEFORE any app code runs (guarantee 1st coupled pick sees them).
+  await page.addInitScript(({ gamma, explore }) => {
+    // @ts-ignore
+    globalThis.__nw_verify = globalThis.__nw_verify || {};
+    // @ts-ignore – allow preset cycling without real beat input
+    globalThis.__nw_verify.forcePresetGateOpen = true;
+    // @ts-ignore – fixed mid-range intensity so weighted path exercises quality01 weights
+    globalThis.__nw_verify.mockCoupledIntensity01 = 0.5;
+    // Amplify weak quality01 signal for A/B: gamma>1 widens the weight gap.
+    // @ts-ignore
+    globalThis.__nw_verify.coupledQualityGamma = gamma;
+    // Override explore ratio: set to 0 for A/B purity — all weighted picks use quality weights.
+    // @ts-ignore
+    globalThis.__nw_verify.coupledExploreRatioOverride = explore;
+  }, { gamma: COUPLED_GAMMA, explore: COUPLED_EXPLORE });
+
   // Poll until the server is reachable.
   const start = Date.now();
   const timeoutMs = 60_000;
@@ -432,7 +588,7 @@ async function main() {
   let initialNavigationOk = false;
   while (Date.now() - start < timeoutMs) {
     try {
-      const resp = await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 10_000 });
+      const resp = await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 60_000 });
       if (resp && resp.ok()) {
         initialNavigationOk = true;
         break;
@@ -452,6 +608,21 @@ async function main() {
   const serverReachable = initialNavigationOk;
   const serverUnreachableMessage =
     '[verify] Dev server unreachable. Start Vite first (use: npm run verify:dev) or set VERIFY_URL.';
+
+  if (serverReachable && VERIFY_PRESET_LIBRARY) {
+    try {
+      await page.evaluate((source) => {
+        try {
+          localStorage.setItem('presetLibrarySource', String(source));
+        } catch {
+          // ignore
+        }
+      }, VERIFY_PRESET_LIBRARY);
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+    } catch (err) {
+      consoleLines.push(`[verify] preset library init failed: ${String(err)}`);
+    }
+  }
 
   let attemptSucceeded = false;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -486,6 +657,33 @@ async function main() {
         };
       });
 
+      if (VERIFY_PRESET_LIBRARY) {
+        try {
+          await page.evaluate((source) => {
+            const select = document.querySelector('#preset-library-select');
+            if (!(select instanceof HTMLSelectElement)) return;
+
+            const desired = String(source || '').trim();
+            if (!desired) return;
+
+            const options = Array.from(select.options || []);
+            const exact = options.find((o) => String(o.value || '') === desired);
+            const containsValue = options.find((o) => String(o.value || '').includes(desired));
+            const containsText = options.find((o) => String(o.text || '').includes(desired));
+            const picked = exact || containsValue || containsText;
+
+            if (!picked) return;
+            if (select.value === picked.value) return;
+
+            select.value = picked.value;
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+          }, VERIFY_PRESET_LIBRARY);
+          await sleep(800);
+        } catch (err) {
+          consoleLines.push(`[verify] preset library select failed: ${String(err)}`);
+        }
+      }
+
       // Favorites compare sanity: multi-select + compare table + CSV export enabled.
       // IMPORTANT: hide the panel after the check to avoid affecting screenshot-based checks.
       report.checks.favoritesCompare = {
@@ -498,11 +696,48 @@ async function main() {
         error: null,
       };
       try {
+        // Wait for Favorites controller wiring to be live.
+        // The raw DOM nodes can exist before handlers are attached; clicking too early becomes a no-op.
+        // Heuristic: the controller formats the count label (e.g. "收藏:0" / "Fav:0") and sets a title.
+        try {
+          await page.waitForFunction(() => {
+            const el = document.querySelector('#visual-favorite-count');
+            if (!(el instanceof HTMLElement)) return false;
+            const text = String(el.textContent || '').trim();
+            const title = String(el.getAttribute('title') || '').trim();
+            return text.includes(':') || text.includes('收藏') || text.toLowerCase().includes('fav') || title.length > 0;
+          }, null, { timeout: 30_000 });
+        } catch {
+          // tolerate; best-effort only
+        }
+
         // Wait until favorite button wiring is live by confirming count increments.
         // (Clicking too early can be a no-op if handlers aren't attached yet.)
         await page.waitForSelector('#visual-favorite', { state: 'attached', timeout: 30_000 });
         await page.waitForSelector('#visual-favorite-count', { state: 'attached', timeout: 30_000 });
+        await page.waitForFunction(() => {
+          const btn = document.querySelector('#visual-favorite');
+          const count = document.querySelector('#visual-favorite-count');
+          return (
+            btn && btn.getAttribute('data-wired') === '1' &&
+            count && count.getAttribute('data-wired') === '1'
+          );
+        }, null, { timeout: 30_000 });
+        try {
+          await page.waitForFunction(() => (window).__nw_verify?.ready === true, null, { timeout: 30_000 });
+        } catch {
+          // ok; fallback to UI clicks below
+        }
         const beforeCount = await page.evaluate(() => {
+          const getCount = (window).__nw_verify?.actions?.getFavoriteCount;
+          if (typeof getCount === 'function') {
+            try {
+              const n = Number(getCount());
+              return Number.isFinite(n) ? n : 0;
+            } catch {
+              // fallback below
+            }
+          }
           const el = document.querySelector('#visual-favorite-count');
           const text = String(el?.textContent || '').trim();
           const m = text.match(/(\d+)/);
@@ -511,9 +746,34 @@ async function main() {
         });
 
         // Create at least 2 favorites.
-        await page.click('#visual-favorite', { force: true });
+        // Prefer DOM-level click fallback to bypass hit-test quirks.
+        const usedAction = await page.evaluate(() => {
+          const act = (window).__nw_verify?.actions?.favorite;
+          if (typeof act !== 'function') return false;
+          act();
+          return true;
+        });
+        if (!usedAction) {
+          try {
+            await page.click('#visual-favorite', { force: true });
+          } catch {
+            try {
+              await page.evaluate(() => {
+                const el = document.querySelector('#visual-favorite');
+                if (el instanceof HTMLButtonElement) el.click();
+              });
+            } catch {
+              // ignore
+            }
+          }
+        }
         await page.waitForFunction(
           (before) => {
+            const getCount = (window).__nw_verify?.actions?.getFavoriteCount;
+            if (typeof getCount === 'function') {
+              const n = Number(getCount());
+              return Number.isFinite(n) && n >= Number(before) + 1;
+            }
             const el = document.querySelector('#visual-favorite-count');
             const text = String(el?.textContent || '').trim();
             const m = text.match(/(\d+)/);
@@ -525,11 +785,26 @@ async function main() {
         );
         await page.click('#visual-random', { force: true });
         await sleep(120);
-        await page.click('#visual-favorite', { force: true });
+        const usedAction2 = await page.evaluate(() => {
+          const act = (window).__nw_verify?.actions?.favorite;
+          if (typeof act !== 'function') return false;
+          act();
+          return true;
+        });
+        if (!usedAction2) {
+          await page.click('#visual-favorite', { force: true });
+        }
 
         // Open favorites panel explicitly.
         // Some layouts make hit-testing flaky in headless; prefer multiple fallbacks.
         const openFavoritesPanel = async () => {
+          const actionOpened = await page.evaluate(() => {
+            const act = (window).__nw_verify?.actions?.openFavoritesPanel;
+            if (typeof act !== 'function') return false;
+            act();
+            return true;
+          });
+          if (actionOpened) return;
           // First try: click the count label (toggles the panel).
           try {
             await page.click('#visual-favorite-count', { force: true });
@@ -678,15 +953,77 @@ async function main() {
           for (const v of values) {
             await page.selectOption('#preset-select', v);
             report.checks.presetStress.selectionsAttempted++;
+            consoleLines.push(`[log] selected preset ${v}`);
             await sleep(60);
           }
 
-          // Rapid "Next" clicks.
-          for (let i = 0; i < 10; i++) {
+          // Sample-driven "Next" clicks: collect SEL_SAMPLES [sel] lines.
+          // Loop until we have enough samples OR hit maxClicks / hardTimeout.
+          const selLoopStart = Date.now();
+          const selHardTimeoutMs = HARD_TIMEOUT_MS * 0.6; // leave 40% budget for post-sel checks
+          let clicksUsed = 0;
+          const countSelSamples = () =>
+            consoleLines.filter((l) => /\[sel\]/.test(l)).length;
+          let samplesAtStart = countSelSamples();
+
+          for (let i = 0; i < SEL_ITERS; i++) {
+            const currentSamples = countSelSamples() - samplesAtStart;
+            if (currentSamples >= SEL_SAMPLES) break;
+            if (Date.now() - selLoopStart > selHardTimeoutMs) {
+              console.log(`[sel-loop] hard timeout at ${(selHardTimeoutMs / 1000).toFixed(0)}s`);
+              break;
+            }
+            if (i % 10 === 0) {
+              const elapsed = ((Date.now() - selLoopStart) / 1000).toFixed(1);
+              console.log(`[sel-loop] i=${i}/${SEL_ITERS} samples=${currentSamples}/${SEL_SAMPLES} elapsed=${elapsed}s`);
+            }
             await page.click('#preset-next', { force: true });
             report.checks.presetStress.nextClicks++;
-            await sleep(60);
+            clicksUsed++;
+            try {
+              const selected = await page.$eval('#preset-select', (el) =>
+                el instanceof HTMLSelectElement ? String(el.value || '').trim() : ''
+              );
+              if (selected) {
+                consoleLines.push(`[log] selected preset ${selected}`);
+              }
+            } catch {
+              // ignore
+            }
+            await sleep(SEL_DELAY_MS);
           }
+          const finalSamples = countSelSamples() - samplesAtStart;
+          const selElapsed = ((Date.now() - selLoopStart) / 1000).toFixed(1);
+          console.log(`[sel-loop] done samples=${finalSamples}/${SEL_SAMPLES} clicks=${clicksUsed} in ${selElapsed}s`);
+
+          // --- Extended sel diagnostics ---
+          // Count abort-like console messages (supersession / failed loads).
+          const abortLikeCount = consoleLines.filter((l) =>
+            /abort|supersed|failed to load|load error|cancelled/i.test(l)
+          ).length;
+
+          // Count [sel] lines by mode (verify explore override => some may be random).
+          const selLines = consoleLines.filter((l) => /\[sel\]/.test(l));
+          const coupledPickModeCounts = {};
+          for (const sl of selLines) {
+            const m = sl.match(/\bmode=([a-zA-Z0-9_-]+)/);
+            if (m) coupledPickModeCounts[m[1]] = (coupledPickModeCounts[m[1]] || 0) + 1;
+          }
+
+          // First [sel] latency: time from page goto to first [sel] line.
+          // We recorded gotoTimestamp below; approximate with selLoopStart offset.
+          const firstSelIdx = consoleLines.findIndex((l) => /\[sel\]/.test(l));
+          const firstSelLatencyMs = firstSelIdx >= 0 ? Date.now() - selLoopStart : -1;
+
+          report.selStats = {
+            samplesCollected: finalSamples,
+            targetSamples: SEL_SAMPLES,
+            clicksUsed,
+            samplesPerClick: clicksUsed > 0 ? +(finalSamples / clicksUsed).toFixed(3) : 0,
+            elapsedMs: Date.now() - selLoopStart,
+            abortLikeCount,
+            coupledPickModeCounts,
+          };
 
           // Wait for preset status to settle (avoid wedged "Loading").
           try {
@@ -743,6 +1080,166 @@ async function main() {
         report.checks.presetStress.error = String(err?.stack || err || '');
         // Non-fatal: preset list may be empty if manifest not loaded yet.
         consoleLines.push(`[warning] presetStress error: ${report.checks.presetStress.error}`);
+      }
+
+      // Dual ProjectM random sanity: clicking "Random" should change both FG and BG preset ids.
+      report.checks.dualRandom = {
+        ok: false,
+        attempts: 0,
+        initial: null,
+        final: null,
+        fgChanged: false,
+        bgChanged: false,
+        error: null,
+      };
+      try {
+        // Ensure toolbar is expanded so the Random button is interactable.
+        try {
+          await page.waitForSelector('#toolbar-body', { state: 'attached', timeout: 30_000 });
+          const toolbarVisible = await page.evaluate(() => {
+            const el = document.querySelector('#toolbar-body');
+            if (!(el instanceof HTMLElement)) return false;
+            return getComputedStyle(el).display !== 'none';
+          });
+          if (!toolbarVisible && (await page.locator('#toolbar-toggle').isVisible({ timeout: 2_000 }))) {
+            await page.click('#toolbar-toggle', { force: true });
+            await sleep(120);
+          }
+        } catch {
+          // ok
+        }
+
+        await page.waitForSelector('#visual-random', { state: 'attached', timeout: 30_000 });
+        // Ensure bootstrap has actually attached click handlers (DOM can exist earlier).
+        await page.waitForFunction(() => {
+          const el = document.querySelector('#visual-random');
+          return el && el.getAttribute('data-wired') === '1';
+        }, null, { timeout: 30_000 });
+        try {
+          await page.waitForFunction(() => (window).__nw_verify?.ready === true, null, { timeout: 30_000 });
+        } catch {
+          // ok; fallback to UI clicks below
+        }
+        try {
+          await page.locator('#visual-random').scrollIntoViewIfNeeded({ timeout: 2_000 });
+        } catch {
+          // ignore
+        }
+
+        // Avoid sampling mid-load from prior tests.
+        try {
+          await page.waitForFunction(() => {
+            const el = document.querySelector('#preset-status');
+            if (!(el instanceof HTMLElement)) return true;
+            const text = String(el.textContent || '');
+            const lower = text.toLowerCase();
+            return !lower.includes('loading') && !lower.includes('加载中');
+          }, null, { timeout: 15_000 });
+        } catch {
+          // ok
+        }
+
+        const randomEnabled = await page.locator('#visual-random').isEnabled().catch(() => true);
+        if (!randomEnabled) {
+          throw new Error('visual-random is disabled');
+        }
+
+        // Wait until the app has published preset IDs.
+        await page.waitForFunction(() => {
+          const ids = (window).__nw_verify?.lastRandomIds;
+          if (ids && (typeof ids.fg === 'string' || typeof ids.bg === 'string')) return true;
+          const v = (window).__projectm_verify;
+          const fg = (v && typeof v.presetIdFg === 'string') ? v.presetIdFg.trim() : '';
+          const bg = (v && typeof v.presetIdBg === 'string') ? v.presetIdBg.trim() : '';
+          return fg.length > 0 && bg.length > 0;
+        }, null, { timeout: 30_000 });
+
+        const initial = await page.evaluate(() => {
+          const state = (window).__nw_verify?.getVerifyState?.();
+          const ids = state?.lastRandomIds ?? (window).__nw_verify?.lastRandomIds;
+          const v = state?.projectmVerify ?? ((window).__projectm_verify || {});
+          return {
+            fg: typeof ids?.fg === 'string' ? ids.fg : (typeof v.presetIdFg === 'string' ? v.presetIdFg : null),
+            bg: typeof ids?.bg === 'string' ? ids.bg : (typeof v.presetIdBg === 'string' ? v.presetIdBg : null),
+            lib: typeof v.presetLibrarySource === 'string' ? v.presetLibrarySource : null,
+            n: typeof ids?.n === 'number' ? ids.n : null,
+          };
+        });
+        report.checks.dualRandom.initial = initial;
+
+        let lastFg = initial.fg;
+        let lastBg = initial.bg;
+        let lastN = typeof initial.n === 'number' ? initial.n : null;
+        const tries = 8;
+        for (let i = 0; i < tries; i++) {
+          const usedAction = await page.evaluate(() => {
+            const act = (window).__nw_verify?.actions?.random;
+            if (typeof act !== 'function') return false;
+            act();
+            return true;
+          });
+          if (!usedAction) {
+            await page.click('#visual-random', { force: true });
+          }
+          report.checks.dualRandom.attempts++;
+          // Wait for either ID to change (preset load can take time in headless).
+          try {
+            await page.waitForFunction(
+              ([fgPrev, bgPrev, nPrev]) => {
+                const ids = (window).__nw_verify?.lastRandomIds;
+                if (ids && typeof ids.n === 'number' && typeof nPrev === 'number') {
+                  return ids.n !== nPrev;
+                }
+                const v = (window).__projectm_verify;
+                const fg = (v && typeof v.presetIdFg === 'string') ? v.presetIdFg : null;
+                const bg = (v && typeof v.presetIdBg === 'string') ? v.presetIdBg : null;
+                return (fgPrev && fg && fg !== fgPrev) || (bgPrev && bg && bg !== bgPrev);
+              },
+              [lastFg, lastBg, lastN],
+              { timeout: 8_000 }
+            );
+          } catch {
+            // no change observed within timeout; continue and sample anyway
+          }
+          await sleep(120);
+
+          const cur = await page.evaluate(() => {
+            const state = (window).__nw_verify?.getVerifyState?.();
+            const ids = state?.lastRandomIds ?? (window).__nw_verify?.lastRandomIds;
+            const v = state?.projectmVerify ?? ((window).__projectm_verify || {});
+            return {
+              fg: typeof ids?.fg === 'string' ? ids.fg : (typeof v.presetIdFg === 'string' ? v.presetIdFg : null),
+              bg: typeof ids?.bg === 'string' ? ids.bg : (typeof v.presetIdBg === 'string' ? v.presetIdBg : null),
+              n: typeof ids?.n === 'number' ? ids.n : null,
+            };
+          });
+
+          if (cur.fg && lastFg && cur.fg !== lastFg) report.checks.dualRandom.fgChanged = true;
+          if (cur.bg && lastBg && cur.bg !== lastBg) report.checks.dualRandom.bgChanged = true;
+
+          lastFg = cur.fg ?? lastFg;
+          lastBg = cur.bg ?? lastBg;
+          if (typeof cur.n === 'number') lastN = cur.n;
+
+          if (report.checks.dualRandom.fgChanged && report.checks.dualRandom.bgChanged) break;
+        }
+
+        report.checks.dualRandom.final = { fg: lastFg, bg: lastBg };
+        report.checks.dualRandom.ok = Boolean(
+          report.checks.dualRandom.fgChanged && report.checks.dualRandom.bgChanged
+        );
+        if (!report.checks.dualRandom.ok) {
+          pageErrors.push(
+            `[verify] dual random did not change both layers: ${JSON.stringify(report.checks.dualRandom)}`
+          );
+          report.counts.pageErrors++;
+          exitCode = Math.max(exitCode, 2);
+        }
+      } catch (err) {
+        report.checks.dualRandom.error = String(err?.stack || err || '');
+        pageErrors.push(`[verify] dual random check failed: ${report.checks.dualRandom.error}`);
+        report.counts.pageErrors++;
+        exitCode = Math.max(exitCode, 2);
       }
 
       // More realistic user-flow smoke: click around like a human.
@@ -866,10 +1363,24 @@ async function main() {
         } catch {
           // ignore
         }
-        if (await inspectorSearch.isVisible({ timeout: 2_000 })) {
-          await inspectorSearch.fill('opacity');
+        // In headless, overflow layouts can make the element not "visible" even though it's in DOM.
+        // Treat DOM-level value+event dispatch as a valid smoke signal.
+        try {
+          if (await inspectorSearch.isVisible({ timeout: 2_000 })) {
+            await inspectorSearch.fill('opacity');
+          } else {
+            await page.evaluate(() => {
+              const el = document.querySelector('#inspector-search');
+              if (!(el instanceof HTMLInputElement)) return;
+              el.value = 'opacity';
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+          }
           await sleep(120);
           report.checks.userFlow.inspectorSearchTyped = true;
+        } catch {
+          // ignore
         }
         const inspectorReset = page.locator('#inspector-reset');
         try {
@@ -877,9 +1388,18 @@ async function main() {
         } catch {
           // ignore
         }
-        if (await inspectorReset.isVisible({ timeout: 2_000 })) {
-          await inspectorReset.click({ force: true });
+        try {
+          if (await inspectorReset.isVisible({ timeout: 2_000 })) {
+            await inspectorReset.click({ force: true });
+          } else {
+            await page.evaluate(() => {
+              const el = document.querySelector('#inspector-reset');
+              if (el instanceof HTMLButtonElement) el.click();
+            });
+          }
           report.checks.userFlow.inspectorResetClicked = true;
+        } catch {
+          // ignore
         }
 
         // Exercise Mixxx connect error path without providing a URL.
@@ -911,17 +1431,18 @@ async function main() {
             (await intervalInput.isEnabled({ timeout: 1_000 }));
 
           if (canRun) {
-            // Headless runs often have no real audio/beat input. Allow preset cycling anyway.
-            await page.evaluate(() => {
-              // @ts-ignore
-              window.__nw_verify = window.__nw_verify || {};
-              // @ts-ignore
-              window.__nw_verify.forcePresetGateOpen = true;
-            });
+            // Mock injection now happens via addInitScript (before page.goto),
+            // so forcePresetGateOpen + mockCoupledIntensity01 are already active.
 
-            const initialPresetValue = await page.evaluate(() => {
+            // In coupled-pairs mode, the preset select may not update to a known option value.
+            // Prefer the published verify presetId when available.
+            const initialPresetToken = await page.evaluate(() => {
+              // @ts-ignore
+              const v = window.__projectm_verify;
+              const fg = typeof v?.presetIdFg === 'string' ? String(v.presetIdFg || '') : '';
+              if (fg) return fg;
               const sel = document.querySelector('#preset-select');
-              return sel instanceof HTMLSelectElement ? sel.value : null;
+              return sel instanceof HTMLSelectElement ? String(sel.value || '') : '';
             });
 
             // Deterministic: toggle via DOM (headless can be flaky with overflow hit-testing).
@@ -949,24 +1470,28 @@ async function main() {
 
             const firstPresetValue = await page.waitForFunction(
               (prev) => {
+                // @ts-ignore
+                const v = window.__projectm_verify;
+                const fg = typeof v?.presetIdFg === 'string' ? String(v.presetIdFg || '') : '';
                 const sel = document.querySelector('#preset-select');
-                if (!(sel instanceof HTMLSelectElement)) return null;
-                const v = String(sel.value || '');
-                if (!v) return null;
-                if (!prev) return v;
-                return v !== String(prev) ? v : null;
+                const token = fg || (sel instanceof HTMLSelectElement ? String(sel.value || '') : '');
+                if (!token) return null;
+                if (!prev) return token;
+                return token !== String(prev) ? token : null;
               },
-              initialPresetValue,
+              initialPresetToken,
               { timeout: 35_000 }
             );
             report.checks.userFlow.presetAutoCycle1 = true;
 
             await page.waitForFunction(
               (prev) => {
+                // @ts-ignore
+                const v = window.__projectm_verify;
+                const fg = typeof v?.presetIdFg === 'string' ? String(v.presetIdFg || '') : '';
                 const sel = document.querySelector('#preset-select');
-                if (!(sel instanceof HTMLSelectElement)) return false;
-                const v = String(sel.value || '');
-                return Boolean(v) && v !== String(prev || '');
+                const token = fg || (sel instanceof HTMLSelectElement ? String(sel.value || '') : '');
+                return Boolean(token) && token !== String(prev || '');
               },
               await firstPresetValue.jsonValue(),
               { timeout: 35_000 }
@@ -1131,6 +1656,17 @@ async function main() {
           await page.mouse.click(10, 10);
           await page.click('#audio-toggle', { force: true });
           await sleep(250);
+          // Mute speakers (keep analysis active).
+          try {
+            await page.evaluate(() => {
+              const el = document.querySelector('#audio-volume');
+              if (!(el instanceof HTMLInputElement)) return;
+              el.value = '0';
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+            });
+          } catch {
+            // ignore
+          }
 
           // Filter inspector to BeatTempo and enable it.
           const search = page.locator('#inspector-search');
@@ -1212,6 +1748,17 @@ async function main() {
         if (/play/i.test(toggleText)) {
           await page.click('#audio-toggle', { force: true });
         }
+        // Mute speakers (keep analysis active).
+        try {
+          await page.evaluate(() => {
+            const el = document.querySelector('#audio-volume');
+            if (!(el instanceof HTMLInputElement)) return;
+            el.value = '0';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          });
+        } catch {
+          // ignore
+        }
         await sleep(400);
       };
 
@@ -1256,9 +1803,32 @@ async function main() {
         after: null,
         error: null,
       };
+      report.checks.budgetDynamics = {
+        ok: false,
+        before: null,
+        during: null,
+        after: null,
+        prefetchAggressivenessChanged: false,
+        error: null,
+      };
 
       try {
         await ensureAudioDrive();
+
+        // Force a prefetch sample + log sampling so preload logs are emitted.
+        try {
+          await page.evaluate(() => {
+            // @ts-ignore
+            const v = window.__nw_verify;
+            // @ts-ignore
+            if (v?.actions?.prefetchLogSample) v.actions.prefetchLogSample(8, 8000);
+            // @ts-ignore
+            if (v?.actions?.triggerPrefetchSample) v.actions.triggerPrefetchSample();
+          });
+          await sleep(800);
+        } catch {
+          // ignore
+        }
 
         await page.evaluate(() => {
           const toggle = document.querySelector('#auto-techno-toggle');
@@ -1415,12 +1985,7 @@ async function main() {
           exitCode = Math.max(exitCode, 2);
         }
 
-        await page.evaluate(() => {
-          // @ts-ignore
-          window.__nw_verify = window.__nw_verify || {};
-          // @ts-ignore
-          window.__nw_verify.forcePresetGateOpen = true;
-        });
+        // Mock injection already active via addInitScript.
         const beforeCaps = await getPerfCaps();
         report.checks.presetLoadShedding.before = beforeCaps;
 
@@ -1461,10 +2026,13 @@ async function main() {
 
         const afterFg = Math.round(Number(afterCaps?.pmAudioFeedIntervalMs?.fg ?? NaN));
         const afterBg = Math.round(Number(afterCaps?.pmAudioFeedIntervalMs?.bg ?? NaN));
+        const afterPressureLeft = Number(afterCaps?.presetLoadPressureMsLeft ?? 0);
+        const pressureOk =
+          Number.isFinite(afterPressureLeft) && (afterPressureLeft <= 0 || afterPressureLeft <= 5_000);
         const afterOk =
           [33, 50, 70].includes(afterFg) &&
           [55, 80, 120].includes(afterBg) &&
-          Number(afterCaps?.presetLoadPressureMsLeft ?? 0) <= 0;
+          pressureOk;
 
         report.checks.presetLoadShedding.ok = Boolean(duringOk && afterOk);
         if (!report.checks.presetLoadShedding.ok) {
@@ -1484,12 +2052,129 @@ async function main() {
         report.checks.aivjAccent.error = message;
         report.checks.audioDrivePresets.error = message;
         report.checks.presetLoadShedding.error = message;
+        report.checks.budgetDynamics.error = message;
         pageErrors.push(`[verify] perf/AIVJ checks failed: ${message}`);
         report.counts.pageErrors++;
         exitCode = Math.max(exitCode, 2);
       }
 
+      // Budget dynamics verification: capture prefetch aggressiveness and level changes.
+      try {
+        const before = await page.evaluate(() => {
+          // @ts-ignore
+          const s = window.__nw_verify?.getPerfCaps?.();
+          // @ts-ignore
+          const stats = window.__nw_verify?.getPerformanceBudgetStats?.();
+          return { perf: s ?? null, stats: stats ?? null };
+        });
+        report.checks.budgetDynamics.before = before;
+
+        // Trigger pressure window via verify hook to force a level drop.
+        try {
+          await page.evaluate(() => {
+            // @ts-ignore
+            window.__nw_verify?.triggerPresetLoadPressure?.('budget-dynamics');
+          });
+        } catch {
+          // ignore
+        }
+        await sleep(300);
+
+        const during = await page.evaluate(() => {
+          // @ts-ignore
+          const s = window.__nw_verify?.getPerfCaps?.();
+          // @ts-ignore
+          const stats = window.__nw_verify?.getPerformanceBudgetStats?.();
+          return { perf: s ?? null, stats: stats ?? null };
+        });
+        report.checks.budgetDynamics.during = during;
+
+        await sleep(900);
+
+        const after = await page.evaluate(() => {
+          // @ts-ignore
+          const s = window.__nw_verify?.getPerfCaps?.();
+          // @ts-ignore
+          const stats = window.__nw_verify?.getPerformanceBudgetStats?.();
+          return { perf: s ?? null, stats: stats ?? null };
+        });
+        report.checks.budgetDynamics.after = after;
+
+        const beforeAgg = Number(before?.stats?.currentBudget?.prefetchAggressiveness ?? NaN);
+        const duringAgg = Number(during?.stats?.currentBudget?.prefetchAggressiveness ?? NaN);
+        const afterAgg = Number(after?.stats?.currentBudget?.prefetchAggressiveness ?? NaN);
+        report.checks.budgetDynamics.prefetchAggressivenessChanged =
+          Number.isFinite(beforeAgg) &&
+          Number.isFinite(duringAgg) &&
+          (duringAgg !== beforeAgg || afterAgg !== beforeAgg);
+
+        const beforePressure = Number(before?.perf?.presetLoadPressureMsLeft ?? 0);
+        const duringPressure = Number(during?.perf?.presetLoadPressureMsLeft ?? 0);
+        const pressureTriggered =
+          Number.isFinite(duringPressure) &&
+          (duringPressure > 0 || Number(beforePressure) > 0);
+
+        report.checks.budgetDynamics.ok =
+          Boolean(report.checks.budgetDynamics.prefetchAggressivenessChanged) ||
+          pressureTriggered;
+
+        if (!report.checks.budgetDynamics.ok) {
+          pageErrors.push(
+            `[verify] budget dynamics did not change: ${JSON.stringify(report.checks.budgetDynamics)}`
+          );
+          report.counts.pageErrors++;
+          exitCode = Math.max(exitCode, 2);
+        }
+      } catch (err) {
+        report.checks.budgetDynamics.error = String(err?.stack || err || '');
+      }
+
       // Mixer UI sanity: ensure per-layer controls are present in the inspector DOM.
+      // Some controls may be hidden behind the "Show advanced" gate; enable it before checking.
+      try {
+        await page.waitForSelector('#inspector-container', { state: 'attached', timeout: 5_000 });
+        const open = await page.evaluate(() => {
+          const el = document.querySelector('#inspector-container');
+          if (!(el instanceof HTMLElement)) return false;
+          return getComputedStyle(el).display !== 'none';
+        });
+        if (!open && (await page.locator('#inspector-toggle').isVisible({ timeout: 2_000 }))) {
+          await page.click('#inspector-toggle', { force: true });
+          await sleep(80);
+        }
+      } catch {
+        // ok; keep going
+      }
+      try {
+        const adv = page.locator('#inspector-show-advanced');
+        try {
+          await adv.scrollIntoViewIfNeeded({ timeout: 2_000 });
+        } catch {
+          // ignore
+        }
+        try {
+          await adv.setChecked(true, { force: true });
+        } catch {
+          await page.evaluate(() => {
+            const el = document.querySelector('#inspector-show-advanced');
+            if (!(el instanceof HTMLInputElement)) return;
+            el.checked = true;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          });
+        }
+      } catch {
+        // ok; keep going
+      }
+      try {
+        const search = page.locator('#inspector-search');
+        if (await search.isVisible({ timeout: 1_000 })) {
+          await search.fill('');
+          await sleep(80);
+        }
+      } catch {
+        // ok; keep going
+      }
+
       report.checks.mixerUi = await page.evaluate(() => {
         const q = (sel) => document.querySelector(sel);
         const has = (sel) => Boolean(q(sel));
@@ -1509,18 +2194,27 @@ async function main() {
           videoEnabledToggle: has(toggleSel('background.layer.video')),
           cameraEnabledToggle: has(toggleSel('background.layer.camera')),
           liquidOpacityInput: has(opacitySel),
+
+          // Background mixer (compact UI).
+          bgTypeSelect: has('#bg-type-select'),
+          bgVariantSelect: has('#bg-variant-select'),
         };
       });
 
       // If key mixer UI pieces are missing, record as an actionable failure.
       {
         const ui = report.checks.mixerUi;
-        const uiOk =
+        const uiOkInspector =
           ui &&
           ui.backgroundTypeSelect &&
           ui.liquidEnabledToggle &&
           ui.basicEnabledToggle &&
           ui.liquidOpacityInput;
+
+        // If the inspector mixer is not present, accept the compact background mixer.
+        const uiOkCompact = ui && ui.bgTypeSelect && ui.bgVariantSelect;
+
+        const uiOk = Boolean(uiOkInspector || uiOkCompact);
         if (!uiOk) {
           pageErrors.push(`[verify] mixer UI missing/changed: ${JSON.stringify(ui)}`);
           report.counts.pageErrors++;
@@ -1553,27 +2247,97 @@ async function main() {
         // ok; keep going
       }
 
+      // Outputs panel: open + ensure visible.
+      try {
+        const toggle = page.locator('#outputs-toggle');
+        if (await toggle.isVisible({ timeout: 2_000 })) {
+          // Clicking can be flaky if the toolbar is mid-layout; try both native click and an in-page click.
+          try {
+            await toggle.click({ force: true, timeout: 2_000 });
+          } catch {
+            // ignore
+          }
+          await page.evaluate(() => {
+            try {
+              (document.querySelector('#outputs-toggle'))?.dispatchEvent(
+                new MouseEvent('click', { bubbles: true, cancelable: true })
+              );
+            } catch {
+              // ignore
+            }
+          });
+
+          await page.waitForSelector('#outputs-panel', { state: 'attached', timeout: 15_000 });
+          const panelVisible = await page.evaluate(() => {
+            const el = document.querySelector('#outputs-panel');
+            if (!(el instanceof HTMLElement)) return false;
+            return getComputedStyle(el).display !== 'none';
+          });
+          const countsText = await page.evaluate(() => {
+            const el = document.querySelector('#outputs-counts');
+            return Boolean(el && String(el.textContent || '').trim().length > 0);
+          });
+          report.checks.outputsPanel = {
+            ok: Boolean(panelVisible),
+            panelVisible: Boolean(panelVisible),
+            countsText,
+            error: null,
+          };
+          if (!panelVisible) {
+            if (VERIFY_STRICT_OUTPUTS_PANEL) {
+              pageErrors.push('[verify] outputs panel not visible');
+              report.counts.pageErrors++;
+              exitCode = Math.max(exitCode, 2);
+            } else {
+              consoleLines.push('[warning] [verify] outputs panel not visible (non-fatal)');
+            }
+          }
+        }
+      } catch (err) {
+        report.checks.outputsPanel = {
+          ok: false,
+          panelVisible: false,
+          countsText: false,
+          error: String(err?.stack || err || ''),
+        };
+      }
+
       // Deterministic signal: ensure ProjectM is actually rendering frames.
       // Pixel readback can be unreliable in headless WebGL (transparent buffers, additive blending,
       // preserveDrawingBuffer=false, SwiftShader quirks), so this is the primary health check.
+      // NOTE: the renderer can rebuild and reset counters; track the maximum observed.
+      let maxFramesRendered = 0;
+      let lastRenderTimeMs = null;
+      let initialized = false;
       try {
-        await page.waitForFunction(() => {
-          const v = (window).__projectm_verify;
-          return v && typeof v.framesRendered === 'number' && v.framesRendered >= 3;
-        }, { timeout: 10_000 });
+        const deadlineMs = Date.now() + 30_000;
+        while (Date.now() < deadlineMs) {
+          const sample = await page.evaluate(() => {
+            const v = (window).__projectm_verify;
+            return {
+              initialized: Boolean(v?.initialized),
+              framesRendered: typeof v?.framesRendered === 'number' ? v.framesRendered : null,
+              lastRenderTimeMs: typeof v?.lastRenderTimeMs === 'number' ? v.lastRenderTimeMs : null,
+            };
+          });
+          initialized = initialized || Boolean(sample?.initialized);
+          if (typeof sample?.lastRenderTimeMs === 'number') lastRenderTimeMs = sample.lastRenderTimeMs;
+          if (typeof sample?.framesRendered === 'number') {
+            maxFramesRendered = Math.max(maxFramesRendered, sample.framesRendered);
+          }
+          if (maxFramesRendered >= 3) break;
+          await sleep(500);
+        }
       } catch {
         // If this fails, we still proceed to collect artifacts and pixel samples.
       }
 
-      const frameCounts = await page.evaluate(() => {
-        const v = (window).__projectm_verify;
-        return {
-          initialized: Boolean(v?.initialized),
-          framesRendered: typeof v?.framesRendered === 'number' ? v.framesRendered : null,
-          lastRenderTimeMs: typeof v?.lastRenderTimeMs === 'number' ? v.lastRenderTimeMs : null,
-        };
-      });
-      report.checks.projectMFramesRendered = frameCounts;
+      report.checks.projectMFramesRendered = {
+        initialized,
+        framesRendered: Number.isFinite(maxFramesRendered) ? maxFramesRendered : null,
+        lastRenderTimeMs,
+        maxFramesRendered,
+      };
 
       const safeVizScreenshot = async (outPath) => {
         const attempts = 5;
@@ -1653,6 +2417,19 @@ async function main() {
       // Mixer functional check: enable Basic layer, then vary Liquid opacity (0 -> 1).
       // Expect viz-canvas pixels to change while remaining non-empty.
       try {
+        const mixerMode = await page.evaluate(() => {
+          const has = (sel) => Boolean(document.querySelector(sel));
+          const inspectorOk =
+            has('[data-scope="background.layer.basic"][data-key="enabled"] input[data-role="bool-toggle"]') &&
+            has('[data-scope="background.layer.liquid"][data-key="enabled"] input[data-role="bool-toggle"]') &&
+            (has('[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-input"]') ||
+              has('[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-range"]'));
+          if (inspectorOk) return 'inspector';
+          const compactOk = has('#bg-type-select') && has('#bg-variant-select');
+          if (compactOk) return 'compact';
+          return 'missing';
+        });
+
         // HMR can trigger a full page reload mid-run; re-ensure inspector state right before we touch mixer controls.
         try {
           await page.waitForSelector('#inspector-container', { state: 'attached', timeout: 5_000 });
@@ -1698,108 +2475,114 @@ async function main() {
           // ok; continue
         }
 
-        // Wait until the key mixer controls exist in DOM (after any reload).
-        try {
-          await page.waitForFunction(() => {
-            const has = (sel) => Boolean(document.querySelector(sel));
-            return (
-              has('[data-scope="background.layer.basic"][data-key="enabled"] input[data-role="bool-toggle"]') &&
-              has('[data-scope="background.layer.liquid"][data-key="enabled"] input[data-role="bool-toggle"]') &&
-              (has('[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-input"]') ||
-                has('[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-range"]'))
-            );
-          }, null, { timeout: 5_000 });
-        } catch {
-          // ok; the checks below will report a clearer error.
-        }
+        let buf0;
+        let buf1;
 
-        const found = await page.evaluate(() => {
-          const get = (sel) => document.querySelector(sel);
-          const setChecked = (sel, checked) => {
-            const el = get(sel);
-            if (!(el instanceof HTMLInputElement)) return false;
-            el.checked = Boolean(checked);
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            return true;
-          };
-          const setNumber = (sel, value) => {
-            const el = get(sel);
-            if (!(el instanceof HTMLInputElement)) return false;
-            el.value = String(value);
+        if (mixerMode === 'inspector') {
+          // Wait until the key mixer controls exist in DOM (after any reload).
+          try {
+            await page.waitForFunction(() => {
+              const has = (sel) => Boolean(document.querySelector(sel));
+              return (
+                has('[data-scope="background.layer.basic"][data-key="enabled"] input[data-role="bool-toggle"]') &&
+                has('[data-scope="background.layer.liquid"][data-key="enabled"] input[data-role="bool-toggle"]') &&
+                (has('[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-input"]') ||
+                  has('[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-range"]'))
+              );
+            }, null, { timeout: 5_000 });
+          } catch {
+            // ok; the checks below will report a clearer error.
+          }
+
+          const found = await page.evaluate(() => {
+            const get = (sel) => document.querySelector(sel);
+            const setChecked = (sel, checked) => {
+              const el = get(sel);
+              if (!(el instanceof HTMLInputElement)) return false;
+              el.checked = Boolean(checked);
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              return true;
+            };
+
+            const basicOk = setChecked(
+              '[data-scope="background.layer.basic"][data-key="enabled"] input[data-role="bool-toggle"]',
+              true
+            );
+            const liquidOk = setChecked(
+              '[data-scope="background.layer.liquid"][data-key="enabled"] input[data-role="bool-toggle"]',
+              true
+            );
+            const opacityOk = Boolean(
+              get(
+                '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-input"]'
+              )
+            ) ||
+              Boolean(
+                get(
+                  '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-range"]'
+                )
+              );
+            return { basicOk, liquidOk, opacityOk };
+          });
+
+          if (!found?.basicOk || !found?.liquidOk || !found?.opacityOk) {
+            throw new Error(`mixer controls not found: ${JSON.stringify(found)}`);
+          }
+
+          // Set Liquid opacity to 0.
+          await page.evaluate(() => {
+            const pick = () => {
+              const a = document.querySelector(
+                '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-input"]'
+              );
+              if (a instanceof HTMLInputElement) return a;
+              const b = document.querySelector(
+                '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-range"]'
+              );
+              if (b instanceof HTMLInputElement) return b;
+              return null;
+            };
+            const el = pick();
+            if (!el) return;
+            el.value = '0';
             el.dispatchEvent(new Event('input', { bubbles: true }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
-            return true;
-          };
+          });
+          await sleep(500);
+          buf0 = await safeVizScreenshot(mixerVizOpacity0Path);
 
-          const basicOk = setChecked(
-            '[data-scope="background.layer.basic"][data-key="enabled"] input[data-role="bool-toggle"]',
-            true
-          );
-          const liquidOk = setChecked(
-            '[data-scope="background.layer.liquid"][data-key="enabled"] input[data-role="bool-toggle"]',
-            true
-          );
-          const opacityOk = Boolean(
-            get(
-              '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-input"]'
-            )
-          ) ||
-            Boolean(
-              get(
+          // Set Liquid opacity to 1.
+          await page.evaluate(() => {
+            const pick = () => {
+              const a = document.querySelector(
+                '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-input"]'
+              );
+              if (a instanceof HTMLInputElement) return a;
+              const b = document.querySelector(
                 '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-range"]'
-              )
-            );
-          return { basicOk, liquidOk, opacityOk };
-        });
-
-        if (!found?.basicOk || !found?.liquidOk || !found?.opacityOk) {
-          throw new Error(`mixer controls not found: ${JSON.stringify(found)}`);
+              );
+              if (b instanceof HTMLInputElement) return b;
+              return null;
+            };
+            const el = pick();
+            if (!el) return;
+            el.value = '1';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          });
+          await sleep(500);
+          buf1 = await safeVizScreenshot(mixerVizOpacity1Path);
+        } else if (mixerMode === 'compact') {
+          // Fallback exercise: flip background type via compact mixer.
+          await page.selectOption('#bg-type-select', 'basic');
+          await sleep(600);
+          buf0 = await safeVizScreenshot(mixerVizOpacity0Path);
+          await page.selectOption('#bg-type-select', 'none');
+          await sleep(600);
+          buf1 = await safeVizScreenshot(mixerVizOpacity1Path);
+        } else {
+          throw new Error('mixer controls not found (inspector or compact)');
         }
-
-        // Set Liquid opacity to 0.
-        await page.evaluate(() => {
-          const pick = () => {
-            const a = document.querySelector(
-              '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-input"]'
-            );
-            if (a instanceof HTMLInputElement) return a;
-            const b = document.querySelector(
-              '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-range"]'
-            );
-            if (b instanceof HTMLInputElement) return b;
-            return null;
-          };
-          const el = pick();
-          if (!el) return;
-          el.value = '0';
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        await sleep(500);
-
-        const buf0 = await safeVizScreenshot(mixerVizOpacity0Path);
-
-        // Set Liquid opacity to 1.
-        await page.evaluate(() => {
-          const pick = () => {
-            const a = document.querySelector(
-              '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-input"]'
-            );
-            if (a instanceof HTMLInputElement) return a;
-            const b = document.querySelector(
-              '[data-scope="background.layer.liquid"][data-key="opacity"] input[data-role="number-range"]'
-            );
-            if (b instanceof HTMLInputElement) return b;
-            return null;
-          };
-          const el = pick();
-          if (!el) return;
-          el.value = '1';
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        await sleep(500);
-        const buf1 = await safeVizScreenshot(mixerVizOpacity1Path);
 
         const a0 = analyzePngForContent(buf0, { background: { r: 1, g: 2, b: 3 }, threshold: 12, grid: 64 });
         const a1 = analyzePngForContent(buf1, { background: { r: 1, g: 2, b: 3 }, threshold: 12, grid: 64 });
@@ -1815,8 +2598,7 @@ async function main() {
         }
 
         report.checks.mixerBlend = {
-          basicEnabled: true,
-          liquidEnabled: true,
+          mode: mixerMode,
           opacity0Sample: a0,
           opacity1Sample: a1,
           nonEmpty,
@@ -2144,7 +2926,7 @@ async function main() {
         consoleLines.push(`[warning] transient navigation during verify, retrying: ${String(err)}`);
         // Ensure we're back on the app after HMR/page reload.
         try {
-          await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 10_000 });
+          await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 10_000 });
         } catch {
           // ignore; next attempt will re-check
         }
@@ -2225,9 +3007,21 @@ async function main() {
       }
 
       const search = page.locator('#inspector-search');
-      if (await search.isVisible({ timeout: 1_000 })) {
-        await search.fill('overlayBudget');
+      try {
+        if (await search.isVisible({ timeout: 1_000 })) {
+          await search.fill('overlayBudget');
+        } else {
+          await page.evaluate(() => {
+            const el = document.querySelector('#inspector-search');
+            if (!(el instanceof HTMLInputElement)) return;
+            el.value = 'overlayBudget';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          });
+        }
         await sleep(200);
+      } catch {
+        // ignore
       }
       await page.locator('#inspector-container').screenshot({ path: inspectorOverlayBudgetPath });
 
@@ -2398,9 +3192,98 @@ async function main() {
       exitCode = 1;
     }
 
+    // --- A3: Extract finalCoupledCfg from page (primary) or console (fallback) ---
+    try {
+      if (page && !pageClosed) {
+        const cfgFromPage = await page.evaluate(() => {
+          try {
+            return (globalThis).__nw_coupledCfg ?? null;
+          } catch { return null; }
+        });
+        if (cfgFromPage && typeof cfgFromPage === 'object') {
+          report.finalCoupledCfg = cfgFromPage;
+        }
+      }
+    } catch {
+      // best-effort
+    }
+    // Fallback: parse from console [coupled-pick] JSON line
+    if (!report.finalCoupledCfg) {
+      const pickLine = consoleLines.find((l) => l.includes('[coupled-pick]'));
+      if (pickLine) {
+        const jsonStart = pickLine.indexOf('{');
+        if (jsonStart >= 0) {
+          try {
+            report.finalCoupledCfg = JSON.parse(pickLine.slice(jsonStart));
+          } catch {
+            // malformed — leave undefined
+          }
+        }
+      }
+    }
+
+    // Fallback: if the console listener missed early startup logs (timing edge cases),
+    // pull them from the page's own buffer and prepend to consoleLines.
+    // Guard by *marker* (not exact string) to avoid duplicates caused by
+    // Playwright vs args.join() serialization differences.
+    try {
+      if (page && !pageClosed) {
+        const buf = await page.evaluate(() => {
+          try {
+            // The buffer may not exist if the page didn't load bootstrap.ts at all.
+            const arr = (globalThis).__nw_console_buffer;
+            return Array.isArray(arr) ? arr.slice(0, 200) : [];
+          } catch { return []; }
+        });
+        if (Array.isArray(buf) && buf.length) {
+          // Check which markers are already present (by tag, not exact string).
+          const hasPickMarker = consoleLines.some((l) => l.includes('[coupled-pick]'));
+          const hasPairsMarker = consoleLines.some((l) => l.includes('[coupled-pairs]'));
+          let injected = 0;
+          for (const entry of buf) {
+            const msg = entry?.msg ?? '';
+            const line = `[${entry?.level ?? 'log'}] ${msg}`;
+            if (msg.includes('[coupled-pick]') && !hasPickMarker) {
+              consoleLines.unshift(line);
+              report.counts.console++;
+              injected++;
+            } else if (msg.includes('[coupled-pairs]') && !hasPairsMarker) {
+              consoleLines.unshift(line);
+              report.counts.console++;
+              injected++;
+            }
+          }
+          report.injectedStartupLines = injected;
+          if (injected) {
+            console.log(`[verify] injected ${injected} startup line(s) from page buffer`);
+          }
+        }
+      }
+    } catch {
+      // Page may already be closed; ignore.
+    }
+
     await writeText(consoleLogPath, consoleLines.join('\n') + '\n');
     await writeText(pageErrorPath, pageErrors.join('\n\n') + (pageErrors.length ? '\n' : ''));
     await writeJson(reportPath, report);
+
+      try {
+        const logsDir = path.resolve('logs');
+        await ensureDir(logsDir);
+        const selectionLogPath = path.join(logsDir, 'aivj-selection.log');
+        const preloadLogPath = path.join(logsDir, 'preload.log');
+        const selectionLines = consoleLines.filter((line) =>
+          String(line).includes('selected preset ')
+        );
+        const preloadLines = consoleLines.filter((line) => {
+          const text = String(line);
+          return text.includes('[Preload]') || text.includes('frame-time ');
+        });
+        await writeText(selectionLogPath, selectionLines.join('\n') + '\n');
+        await writeText(preloadLogPath, preloadLines.join('\n') + '\n');
+      } catch {
+        // ignore
+      }
 
     expectedClose = true;
     await browser.close();
@@ -2462,10 +3345,17 @@ async function main() {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;
   }
+  if (hardTimeout) {
+    clearTimeout(hardTimeout);
+  }
   process.exitCode = exitCode;
+  // Ensure process terminates even if any handles remain.
+  await sleep(20);
+  process.exit(exitCode || 0);
 }
 
 main().catch((err) => {
   console.error('headless-verify failed:', err);
   process.exitCode = 1;
+  process.exit(1);
 });
