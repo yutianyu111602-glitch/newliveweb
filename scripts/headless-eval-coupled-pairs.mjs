@@ -6,6 +6,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import net from 'node:net';
 import readline from 'node:readline';
 import { chromium } from 'playwright';
 
@@ -573,6 +574,25 @@ async function waitForViteDevServer(url, timeoutMs = 2_500) {
   await waitForHttpOk(viteClientUrl, timeoutMs);
 }
 
+/**
+ * Probe for a free TCP port starting at `start`, checking up to `maxProbe` ports.
+ * Returns the first available port.
+ */
+async function findFreePort(start = 5174, maxProbe = 50) {
+  for (let p = start; p < start + maxProbe; p++) {
+    const ok = await new Promise((resolve) => {
+      const srv = net.createServer();
+      srv.unref();
+      srv.on('error', () => resolve(false));
+      srv.listen(p, '127.0.0.1', () => {
+        srv.close(() => resolve(true));
+      });
+    });
+    if (ok) return p;
+  }
+  throw new Error(`No free port found in range ${start}–${start + maxProbe - 1}`);
+}
+
 async function killProcessTree(child) {
   if (!child || typeof child.pid !== 'number') return;
   if (process.platform === 'win32') {
@@ -744,14 +764,23 @@ async function main() {
       'Heuristic flags: --motionMin 0.000015 --lumaMin 0.06 (override okHeuristic thresholds for low-motion / too-dark)'
     );
     console.log('Manifest flags: --pairsManifest pairs-manifest.v0.json (filename inside public/presets/<pack>/, default: pairs-manifest.v0.json)');
-    console.log('Vite flags: --noSpawnVite, --headed');
+    console.log('Vite flags: --noSpawnVite, --vitePort auto|<port> (default: auto), --headed');
     console.log('Resume flags: --resume (continue in existing outDir by reading eval.jsonl/meta.json)');
     process.exitCode = 0;
     return;
   }
 
   const host = String(resolveArg(parsed, 'host', '127.0.0.1')).trim() || '127.0.0.1';
-  const port = Number(resolveArg(parsed, 'port', '5174')) || 5174;
+  const vitePortRaw = String(resolveArg(parsed, 'vitePort', resolveArg(parsed, 'port', 'auto'))).trim();
+  const vitePortMode = vitePortRaw.toLowerCase() === 'auto' ? 'auto' : 'fixed';
+  const port = await (async () => {
+    if (vitePortMode === 'auto') {
+      const p = await findFreePort(5174, 50);
+      console.log(`[eval] vitePort=auto → resolved to ${p}`);
+      return p;
+    }
+    return Number(vitePortRaw) || 5174;
+  })();
   const coupledPickRaw = String(resolveArg(parsed, 'coupledPick', 'random'));
   const coupledPick = (() => {
     const v = coupledPickRaw.trim().toLowerCase();
@@ -892,6 +921,8 @@ async function main() {
     startedAt,
     finishedAt: null,
     urlBase: baseUrl,
+    vitePort: port,
+    vitePortMode,
     coupledPick,
     targetSamples: targetSamples || null,
     // P1.2A: 时间预算分解

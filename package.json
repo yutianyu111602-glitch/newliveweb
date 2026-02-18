@@ -39,8 +39,8 @@
     "diag:pack:gate": "node scripts/diagnose-pack-diversity.mjs --gate --trend 20",
     "diag:pack:trend": "node scripts/diagnose-pack-diversity.mjs --trend 50 --gate",
     "diag:pack:advice": "node scripts/pack-gate-advice.mjs",
-    "coupled:smoke:current": "pwsh -NoProfile -File scripts/coupled-smoke-current.ps1",
-    "coupled:test:manifest-mismatch": "pwsh -NoProfile -File scripts/coupled-negative-manifest-mismatch.ps1"
+    "coupled:smoke:current": "pwsh -NoProfile -File scripts/coupled-smoke-current.ps1 || powershell -NoProfile -ExecutionPolicy Bypass -File scripts/coupled-smoke-current.ps1",
+    "coupled:test:manifest-mismatch": "pwsh -NoProfile -File scripts/coupled-negative-manifest-mismatch.ps1 || powershell -NoProfile -ExecutionPolicy Bypass -File scripts/coupled-negative-manifest-mismatch.ps1"
   },
   "dependencies": {
     "@mediapipe/selfie_segmentation": "^0.1.1675465747",

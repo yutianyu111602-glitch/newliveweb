@@ -34,7 +34,7 @@ param(
 
   # Verify
   [string]$HostName = "127.0.0.1",
-  [int]$Port = 5174,
+  [string]$Port = "auto",
   [string]$VerifyPack = "ai_generated_coupled_final",
   [int]$HardTimeoutMs = 900000,
   [switch]$SkipVerify,
@@ -134,7 +134,7 @@ try {
     $evalScript,
     "--packs", ($packsList -join ","),
     "--host", $HostName,
-    "--port", [string]$Port,
+    "--vitePort", [string]$Port,
     "--coupledPick", $EvalPickMode,
     "--gpuMode", $GpuMode,
     "--targetCoverage", [string]$TargetCoverage,

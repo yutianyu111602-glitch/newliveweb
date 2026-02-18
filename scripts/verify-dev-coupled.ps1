@@ -8,7 +8,7 @@
 param(
   [string]$Pack = "ai_generated_coupled_final",
   [string]$HostName = "127.0.0.1",
-  [int]$Port = 5174,
+  [string]$VitePort = "auto",
   [string]$OutDir = "",
   [int]$TargetSamples = 5,
   [double]$MaxHours = 0.15,
@@ -71,6 +71,8 @@ try {
   $nodeArgs = @(
     $evalScript,
     "--pack", $Pack,
+    "--host", $HostName,
+    "--vitePort", $VitePort,
     "--targetSamples", "$TargetSamples",
     "--maxHours", "$MaxHours",
     "--audioMode", $AudioMode,
