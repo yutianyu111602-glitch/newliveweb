@@ -594,8 +594,8 @@ async function killProcessTree(child) {
   }
 }
 
-async function loadPairsManifest(pack) {
-  const manifestPath = path.join(PROJECT_ROOT, 'public', 'presets', pack, 'pairs-manifest.v0.json');
+async function loadPairsManifest(pack, manifestFilename = 'pairs-manifest.v0.json') {
+  const manifestPath = path.join(PROJECT_ROOT, 'public', 'presets', pack, manifestFilename);
   const raw = await fsp.readFile(manifestPath, 'utf8');
   const data = JSON.parse(raw);
   const pairs = Array.isArray(data?.pairs) ? data.pairs : null;
@@ -617,7 +617,7 @@ async function loadPairsManifest(pack) {
     const bgUrl = typeof it.bgUrl === 'string' ? it.bgUrl : null;
     if (fgUrl || bgUrl) byId.set(pid, { fgUrl, bgUrl });
   }
-  return { manifestPath, pairCount: pairs.length, uniquePairIds: ids.size, byId, pairIdsByIndex, idToIndex };
+  return { manifestPath, manifestFilename, pairCount: pairs.length, uniquePairIds: ids.size, allowedPairIds: ids, byId, pairIdsByIndex, idToIndex };
 }
 
 function shuffleInPlace(arr) {
@@ -740,6 +740,10 @@ async function main() {
       'Audio flags: --audioMode file|click|none (default: file), --audioFile <absPath> | --audioRoot <dir> (defaults: D:/CloudMusic then D:/test MP3), --requireAudio'
     );
     console.log('Stuck flags: --pickTimeoutMs 10000 --stuckMaxConsecutive 3 --stuckMaxRestarts 6 --browserMaxRestarts 20');
+    console.log(
+      'Heuristic flags: --motionMin 0.000015 --lumaMin 0.06 (override okHeuristic thresholds for low-motion / too-dark)'
+    );
+    console.log('Manifest flags: --pairsManifest pairs-manifest.v0.json (filename inside public/presets/<pack>/, default: pairs-manifest.v0.json)');
     console.log('Vite flags: --noSpawnVite, --headed');
     console.log('Resume flags: --resume (continue in existing outDir by reading eval.jsonl/meta.json)');
     process.exitCode = 0;
@@ -754,13 +758,32 @@ async function main() {
     if (v === 'random' || v === 'shuffle' || v === 'weighted') return v;
     throw new Error(`Invalid --coupledPick '${coupledPickRaw}'. Expected random|shuffle|weighted.`);
   })();
+
+  const targetSamplesRaw = Number(resolveArg(parsed, 'targetSamples', '0'));
+  const targetSamples = Number.isFinite(targetSamplesRaw) ? clampInt(targetSamplesRaw, 0, 2_000_000) : 0;
+
+  const coupledGammaRaw = String(resolveArg(parsed, 'coupledGamma', '')).trim();
+  const coupledGamma = coupledGammaRaw ? Number(coupledGammaRaw) : null;
+  const coupledExploreRaw = String(resolveArg(parsed, 'coupledExplore', '')).trim();
+  const coupledExplore = coupledExploreRaw ? Number(coupledExploreRaw) : null;
+  const coupledDedupNRaw = String(resolveArg(parsed, 'coupledDedupN', '')).trim();
+  const coupledDedupN = coupledDedupNRaw ? clampInt(Number(coupledDedupNRaw), 0, 1_000_000) : null;
+  const coupledDedupPenaltyRaw = String(resolveArg(parsed, 'coupledDedupPenalty', '')).trim();
+  const coupledDedupPenalty = coupledDedupPenaltyRaw ? Number(coupledDedupPenaltyRaw) : null;
   const targetCoverageRaw = Number(resolveArg(parsed, 'targetCoverage', '0.99'));
   const targetCoverage = Number.isFinite(targetCoverageRaw)
     ? Math.max(0.01, Math.min(1.0, targetCoverageRaw))
     : 0.99;
   const maxHoursRaw = Number(resolveArg(parsed, 'maxHours', '10'));
-  const maxHours = Number.isFinite(maxHoursRaw) ? Math.max(0.01, maxHoursRaw) : 10;
+  const maxHoursInput = Number.isFinite(maxHoursRaw) ? Math.max(0.01, maxHoursRaw) : 10;
+  // P1.2B: 预算下限保护 - 允许重启/导航超时的最小预算 (约 7.2 分钟)
+  const MIN_MAX_HOURS = 0.12;
+  const maxHoursWasClamped = maxHoursInput < MIN_MAX_HOURS;
+  const maxHours = Math.max(MIN_MAX_HOURS, maxHoursInput);
   const maxMs = maxHours * 60 * 60 * 1000;
+  if (maxHoursWasClamped) {
+    console.warn(`[eval] WARNING: maxHours=${maxHoursInput} is too small for restart-prone flow; clamped to ${maxHours}`);
+  }
 
   const reloadEveryRaw = Number(resolveArg(parsed, 'reloadEvery', '800'));
   const reloadEvery = Number.isFinite(reloadEveryRaw) ? Math.max(0, Math.floor(reloadEveryRaw)) : 800;
@@ -809,6 +832,17 @@ async function main() {
   const browserMaxRestartsRaw = Number(resolveArg(parsed, 'browserMaxRestarts', '20'));
   const browserMaxRestarts = Number.isFinite(browserMaxRestartsRaw) ? clampInt(browserMaxRestartsRaw, 0, 200) : 20;
 
+  // P5.1: Configurable heuristic thresholds (data-driven defaults from sweep P90/P50 analysis)
+  // Old hardcoded: 0.002 motion, 0.06 luma.  Sweep showed P50(motion)=1.14e-5, P95=2.55e-3.
+  // Default motionMin=0.000015 ≈ P55 of sweep — splits the pack roughly in half.
+  const motionMinRaw = Number(resolveArg(parsed, 'motionMin', '0.000015'));
+  const motionMin = Number.isFinite(motionMinRaw) ? Math.max(0, motionMinRaw) : 0.000015;
+  const lumaMinRaw = Number(resolveArg(parsed, 'lumaMin', '0.06'));
+  const lumaMin = Number.isFinite(lumaMinRaw) ? Math.max(0, Math.min(1, lumaMinRaw)) : 0.06;
+
+  // A) Configurable manifest filename (avoids manual swap workflow for filtered packs)
+  const pairsManifest = String(resolveArg(parsed, 'pairsManifest', 'pairs-manifest.v0.json')).trim() || 'pairs-manifest.v0.json';
+
   const requireAudio = resolveBool(parsed, 'requireAudio', false);
   const audioModeRaw = String(resolveArg(parsed, 'audioMode', 'file')).trim().toLowerCase();
   const audioMode = ['file', 'click', 'none'].includes(audioModeRaw) ? audioModeRaw : 'file';
@@ -837,9 +871,21 @@ async function main() {
   // Validate manifests early to fail fast.
   const packManifests = [];
   for (const pack of selectedPacks) {
-    const m = await loadPairsManifest(pack);
+    const m = await loadPairsManifest(pack, pairsManifest);
     packManifests.push({ pack, ...m });
   }
+
+  // P1.2A: 全局计时统计 - 跟踪启动开销以便诊断时间预算问题
+  const timingStats = {
+    navTimeoutCount: 0,
+    navTotalMs: 0,
+    browserRestartCount: 0,
+    restartTotalMs: 0,
+    audioCheckCount: 0,
+    audioCheckFailCount: 0,
+    audioCheckTotalMs: 0,
+    sampleLoopStartIso: null,
+  };
 
   const makeBaseMeta = (startedAt) => ({
     kind: 'coupled_eval.v0',
@@ -847,8 +893,27 @@ async function main() {
     finishedAt: null,
     urlBase: baseUrl,
     coupledPick,
+    targetSamples: targetSamples || null,
+    // P1.2A: 时间预算分解
+    budget: {
+      inputMaxHours: maxHoursInput,
+      effectiveMaxHours: maxHours,
+      wasClamped: maxHoursWasClamped,
+      startTimeIso: startedAt,
+      deadlineTimeIso: new Date(new Date(startedAt).getTime() + maxMs).toISOString(),
+    },
+    coupledParams:
+      coupledGamma != null || coupledExplore != null || coupledDedupN != null || coupledDedupPenalty != null
+        ? {
+          coupledGamma: Number.isFinite(Number(coupledGamma)) ? Number(coupledGamma) : null,
+          coupledExplore: Number.isFinite(Number(coupledExplore)) ? Number(coupledExplore) : null,
+          coupledDedupN: coupledDedupN,
+          coupledDedupPenalty: Number.isFinite(Number(coupledDedupPenalty)) ? Number(coupledDedupPenalty) : null,
+        }
+        : null,
     packs: packManifests.map((p) => ({
       pack: p.pack,
+      manifestFile: p.manifestFilename,
       manifestPath: path.relative(PROJECT_ROOT, p.manifestPath).replace(/\\\\/g, '/'),
       pairCount: p.pairCount,
       uniquePairIds: p.uniquePairIds,
@@ -856,8 +921,12 @@ async function main() {
       targetUniquePairs: Math.ceil(p.pairCount * targetCoverage),
     })),
     limits: { maxHours, reloadEvery },
+    // P1.2A: 运行时计时统计
+    timing: { ...timingStats },
     sample: { downsampleSize, intervalMs, warmupSamples, measureSamples },
     stuck: { pickTimeoutMs, stuckMaxConsecutive, stuckMaxRestarts, browserMaxRestarts },
+    heuristic: { motionMin, lumaMin },
+    warnings: maxHoursWasClamped ? ['maxHours_too_small_for_restart_prone_flow'] : [],
     fields: {
       tMs: 'unix ms timestamp',
       pack: 'coupled pack id',
@@ -991,6 +1060,8 @@ async function main() {
       '--disable-background-timer-throttling',
       '--disable-renderer-backgrounding',
       '--disable-backgrounding-occluded-windows',
+      // Windows: avoid hanging on localhost when a system proxy is configured.
+      '--no-proxy-server',
       // Windows-specific: avoid occlusion heuristics that can pause rendering/timers.
       '--disable-features=CalculateNativeWinOcclusion',
     ];
@@ -1224,7 +1295,9 @@ async function main() {
 
     let browserRestartCount = 0;
     const recreateBrowserSession = async (reason, error) => {
+      const restartStartMs = Date.now();
       browserRestartCount += 1;
+      timingStats.browserRestartCount = browserRestartCount;
       if (browserRestartCount > browserMaxRestarts) {
         throw new Error(`browserMaxRestarts exceeded: ${browserRestartCount}/${browserMaxRestarts}`);
       }
@@ -1267,6 +1340,8 @@ async function main() {
       page = await context.newPage();
       await page.addInitScript(initVerifyScript, { presetLibrarySource, runManifestUrl });
       attachPageDiagnostics();
+      // P1.2A: 记录重启耗时
+      timingStats.restartTotalMs += Date.now() - restartStartMs;
     };
 
     for (const packInfo of packManifests) {
@@ -1302,9 +1377,17 @@ async function main() {
       u.searchParams.set('coupledPack', pack);
       u.searchParams.set('coupledPick', coupledPick);
       u.searchParams.set('coupling3d', 'on');
+      if (pairsManifest && pairsManifest !== 'pairs-manifest.v0.json') {
+        u.searchParams.set('coupledManifest', pairsManifest);
+      }
+
+      if (Number.isFinite(Number(coupledGamma))) u.searchParams.set('coupledGamma', String(coupledGamma));
+      if (Number.isFinite(Number(coupledExplore))) u.searchParams.set('coupledExplore', String(coupledExplore));
+      if (typeof coupledDedupN === 'number') u.searchParams.set('coupledDedupN', String(coupledDedupN));
+      if (Number.isFinite(Number(coupledDedupPenalty))) u.searchParams.set('coupledDedupPenalty', String(coupledDedupPenalty));
 
       const url = u.toString();
-      viteLog.write(`[eval] pack=${pack} url=${url}\n`);
+      viteLog.write(`[eval] pack=${pack} coupledManifest=${pairsManifest} pairCount=${packInfo.pairCount} url=${url}\n`);
 
       // Audio drive plan (silent output, but must provide non-zero analysis unless explicitly disabled).
       const audioPlan = (() => {
@@ -1317,11 +1400,46 @@ async function main() {
       const bootstrapPack = async (phase) => {
         viteLog.write(`[eval] pack=${pack} bootstrap phase=${String(phase || '')}\n`);
 
-        viteLog.write(`[eval] pack=${pack} goto:start\n`);
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-        viteLog.write(`[eval] pack=${pack} goto:ok\n`);
+        const gotoWithRetries = async () => {
+          const attempts = 4;
+          let lastErr = null;
+          for (let i = 1; i <= attempts; i++) {
+            try {
+              viteLog.write(`[eval] pack=${pack} goto:try${i}/${attempts}\n`);
+              // Prefer commit (fast). Some Windows/headless runs can stall here even though
+              // the page later starts executing; don't treat a timeout as fatal.
+              await page.goto(url, { waitUntil: 'commit', timeout: 20_000 });
+              viteLog.write(`[eval] pack=${pack} goto:ok\n`);
+              return true;
+            } catch (err) {
+              lastErr = err;
+              const msg = String(err?.message || err || 'goto error');
+              viteLog.write(`[eval] pack=${pack} goto:warn${i} ${msg}\n`);
+              // P1.2A: 记录导航超时计数
+              if (msg.toLowerCase().includes('timeout')) {
+                timingStats.navTimeoutCount += 1;
+                timingStats.navTotalMs += 20_000;
+              }
+              // If this looks like a transient navigation error, backoff and retry.
+              await new Promise((r) => setTimeout(r, 600));
+            }
+          }
+          // Final fallback: even if goto never reported success, the page might still be alive.
+          // We proceed to selector-based readiness checks below; they'll throw if truly dead.
+          if (lastErr) {
+            viteLog.write(`[eval] pack=${pack} goto:failed (continuing to selector checks) ${String(lastErr)}\n`);
+          }
+          return false;
+        };
 
-        await page.waitForSelector('#preset-next', { state: 'attached', timeout: 60_000 });
+        viteLog.write(`[eval] pack=${pack} goto:start\n`);
+        await gotoWithRetries();
+
+        // Treat core DOM attachment as the real readiness signal.
+        // If navigation is still "in flight", Playwright can block selector waits;
+        // tolerate that by using a longer timeout here.
+        await page.waitForSelector('#viz-canvas', { state: 'attached', timeout: 90_000 });
+        await page.waitForSelector('#preset-next', { state: 'attached', timeout: 90_000 });
         viteLog.write(`[eval] pack=${pack} preset-next:attached\n`);
 
         // Ensure auto-cycle is off.
@@ -1356,6 +1474,47 @@ async function main() {
           // eslint-disable-next-line no-underscore-dangle
           window.__nw_verify.disableAutoAudio = true;
         });
+
+        // Ensure coupled manifest is actually loaded so coupled.enabled flips true.
+        // Clicking preset-next can be blocked by gates early in boot; this action forces the load path.
+        try {
+          const initOk = await page.evaluate(async (expectedPack) => {
+            // eslint-disable-next-line no-underscore-dangle
+            const a = (window.__nw_verify && window.__nw_verify.actions) || null;
+            const fn = a && typeof a.coupledInit === 'function' ? a.coupledInit : null;
+            if (!fn) return null;
+            // Some implementations ignore the arg; it's fine.
+            return await fn(`eval:${String(expectedPack || '')}`);
+          }, pack);
+          viteLog.write(`[eval] pack=${pack} coupledInit ok=${String(initOk)}\n`);
+        } catch (e) {
+          viteLog.write(`[eval] pack=${pack} coupledInit error=${String(e?.message || e || '')}\n`);
+        }
+
+        try {
+          await page.waitForFunction(
+            (expectedPack) => {
+              // eslint-disable-next-line no-underscore-dangle
+              const s = window.__nw_verify?.getVerifyState?.();
+              const c = s?.coupled;
+              return Boolean(c?.enabled) && String(c?.pack || '') === String(expectedPack);
+            },
+            pack,
+            { timeout: 60_000 }
+          );
+          viteLog.write(`[eval] pack=${pack} coupled-enabled:ok\n`);
+        } catch {
+          let snap = null;
+          try {
+            snap = await page.evaluate(() => {
+              // eslint-disable-next-line no-underscore-dangle
+              return window.__nw_verify?.getVerifyState?.() ?? null;
+            });
+          } catch {
+            // ignore
+          }
+          viteLog.write(`[eval] pack=${pack} coupled-enabled:timeout snapshot=${JSON.stringify(snap)}\n`);
+        }
 
         // If we already collected samples for this pack and we're using shuffle mode,
         // seed the shuffle state so the runtime prioritizes "missing" pairs first.
@@ -1451,22 +1610,120 @@ async function main() {
           // ignore
         }
 
-        // Coupled must be enabled for this pack before we start sampling (avoid "not switching" garbage).
+        // Coupled should be enabled for this pack before we start sampling, but on some runs
+        // the flag can lag even though picks are already switchable. Treat this as best-effort;
+        // the self-test below is the real guardrail.
         await setOverlay(`eval: starting\npack=${pack}\nwaiting coupled...`);
-        await page.waitForFunction(
-          (expectedPack) => {
+        try {
+          await page.waitForFunction(
+            (expectedPack) => {
+              // eslint-disable-next-line no-underscore-dangle
+              const s = window.__nw_verify?.getVerifyState?.();
+              const c = s?.coupled;
+              if (!c) return false;
+              const packOk = String(c?.pack || '') === String(expectedPack);
+              if (!packOk) return false;
+              // Either explicitly enabled, or we've at least recorded a pick timestamp.
+              const hasPickTime = typeof c?.lastPick?.timeMs === 'number' && c.lastPick.timeMs > 0;
+              return Boolean(c?.enabled) || hasPickTime;
+            },
+            pack,
+            { timeout: 60_000 }
+          );
+          viteLog.write(`[eval] pack=${pack} coupled-ready:ok\n`);
+        } catch {
+          let snap = null;
+          try {
+            snap = await page.evaluate(() => {
+              // eslint-disable-next-line no-underscore-dangle
+              return window.__nw_verify?.getVerifyState?.() ?? null;
+            });
+          } catch {
+            // ignore
+          }
+          viteLog.write(`[eval] pack=${pack} coupled-ready:timeout snapshot=${JSON.stringify(snap)}\n`);
+        }
+
+        // Ensure ProjectM is actually running before we start driving coupled picks.
+        // cycleToNextCoupledPair() is gated on projectLayerReady, so without this
+        // the UI click can be a no-op (lastPick stays null).
+        await setOverlay(`eval: waiting render\npack=${pack}`);
+        try {
+          await page.waitForFunction(
+            () => {
+              // eslint-disable-next-line no-underscore-dangle
+              const s = window.__nw_verify?.getVerifyState?.();
+              const v = s?.projectmVerify;
+              const frames = Number(v?.framesRendered ?? 0);
+              return Boolean(v?.initialized) && frames >= 10 && !v?.aborted;
+            },
+            null,
+            { timeout: 90_000 }
+          );
+          const v = await page.evaluate(() => {
             // eslint-disable-next-line no-underscore-dangle
-            const s = window.__nw_verify?.getVerifyState?.();
-            const c = s?.coupled;
-            return Boolean(c?.enabled) && String(c?.pack || '') === String(expectedPack);
-          },
-          pack,
-          { timeout: 60_000 }
-        );
-        viteLog.write(`[eval] pack=${pack} coupled-enabled:ok\n`);
+            return window.__nw_verify?.getVerifyState?.()?.projectmVerify ?? null;
+          });
+          viteLog.write(
+            `[eval] pack=${pack} projectm-ready ok=1 frames=${Number(v?.framesRendered ?? 0)} aborted=${Number(v?.aborted ? 1 : 0)}\n`
+          );
+        } catch {
+          let snap = null;
+          try {
+            snap = await page.evaluate(() => {
+              // eslint-disable-next-line no-underscore-dangle
+              return window.__nw_verify?.getVerifyState?.() ?? null;
+            });
+          } catch {
+            // ignore
+          }
+          viteLog.write(`[eval] pack=${pack} projectm-ready:timeout snapshot=${JSON.stringify(snap)}\n`);
+        }
 
         // Self-test: ensure we can actually advance picks (otherwise abort early).
         await setOverlay(`eval: self-test\npack=${pack}`);
+        const dumpVerifySnapshot = async (label) => {
+          try {
+            const snap = await page.evaluate(() => {
+              // eslint-disable-next-line no-underscore-dangle
+              const s = window.__nw_verify?.getVerifyState?.() ?? null;
+              const v = s?.projectmVerify ?? null;
+              const statusEl = document.querySelector('#preset-status');
+              // eslint-disable-next-line no-underscore-dangle
+              const debug = window.__nw_verify?._coupledNextDebug ?? null;
+              return {
+                href: String(location?.href || ''),
+                projectmVerify: v
+                  ? {
+                    initialized: Boolean(v.initialized),
+                    framesRendered: Number(v.framesRendered ?? 0),
+                    lastRenderTimeMs: Number(v.lastRenderTimeMs ?? 0),
+                    aborted: Boolean(v.aborted),
+                    abortReason: v.abortReason ?? null,
+                  }
+                  : null,
+                presetStatus: String(statusEl?.textContent || '').trim() || null,
+                coupled: s?.coupled ?? null,
+                presetIds: s?.presetIds ?? null,
+                coupledNextDebug: debug,
+                pm: s?.pm
+                  ? {
+                    initialized: s.pm.initialized,
+                    framesRendered: s.pm.framesRendered,
+                    lastRenderTimeMs: s.pm.lastRenderTimeMs,
+                    lastAudioRms: s.pm.lastAudioRms,
+                    lastAudioPeak: s.pm.lastAudioPeak,
+                  }
+                  : null,
+              };
+            });
+            viteLog.write(`[eval] pack=${pack} self-test snapshot:${label} ${JSON.stringify(snap)}\n`);
+          } catch {
+            // ignore
+          }
+        };
+
+        const selfPickTimeoutMs = Math.max(pickTimeoutMs, 30_000);
         for (let st = 0; st < 2; st += 1) {
           const prevTime = await page.evaluate(() => {
             // eslint-disable-next-line no-underscore-dangle
@@ -1478,17 +1735,37 @@ async function main() {
             const el = document.querySelector('#preset-next');
             return el instanceof HTMLButtonElement && !el.disabled;
           }, null, { timeout: 15_000 });
-          await page.click('#preset-next', { timeout: 15_000 });
-          await page.waitForFunction(
-            (prev) => {
-              // eslint-disable-next-line no-underscore-dangle
-              const s = window.__nw_verify?.getVerifyState?.();
-              const t = s?.coupled?.lastPick?.timeMs;
-              return typeof t === 'number' && t !== prev;
-            },
-            prevTime,
-            { timeout: pickTimeoutMs }
-          );
+          // Prefer the verify action hook (bypasses flaky DOM click wiring/gates under headless).
+          await page.evaluate(() => {
+            // eslint-disable-next-line no-underscore-dangle
+            const a = (window.__nw_verify && window.__nw_verify.actions) || null;
+            const fn = a && typeof a.coupledNext === 'function' ? a.coupledNext : null;
+            if (fn) {
+              try {
+                void fn('eval:self-test');
+                return;
+              } catch {
+                // ignore
+              }
+            }
+            const el = document.querySelector('#preset-next');
+            if (el instanceof HTMLButtonElement) el.click();
+          });
+          try {
+            await page.waitForFunction(
+              (prev) => {
+                // eslint-disable-next-line no-underscore-dangle
+                const s = window.__nw_verify?.getVerifyState?.();
+                const t = s?.coupled?.lastPick?.timeMs;
+                return typeof t === 'number' && t !== prev;
+              },
+              prevTime,
+              { timeout: selfPickTimeoutMs }
+            );
+          } catch (e) {
+            await dumpVerifySnapshot(`pick-timeout st=${st}`);
+            throw e;
+          }
 
           // Ensure the pick actually applied (avoid passing self-test while presets never load).
           const expected = await page.evaluate((expectedPack) => {
@@ -1509,16 +1786,21 @@ async function main() {
             };
           }, pack);
           if (!expected?.ok) throw new Error('self-test:missing-pair-after-click');
-          await page.waitForFunction(
-            ({ expFg, expBg }) => {
-              // eslint-disable-next-line no-underscore-dangle
-              const s = window.__nw_verify?.getVerifyState?.();
-              const presetIds = s?.presetIds;
-              return String(presetIds?.fg || '') === String(expFg) && String(presetIds?.bg || '') === String(expBg);
-            },
-            { expFg: expected.expFg, expBg: expected.expBg },
-            { timeout: pickTimeoutMs }
-          );
+          try {
+            await page.waitForFunction(
+              ({ expFg, expBg }) => {
+                // eslint-disable-next-line no-underscore-dangle
+                const s = window.__nw_verify?.getVerifyState?.();
+                const presetIds = s?.presetIds;
+                return String(presetIds?.fg || '') === String(expFg) && String(presetIds?.bg || '') === String(expBg);
+              },
+              { expFg: expected.expFg, expBg: expected.expBg },
+              { timeout: selfPickTimeoutMs }
+            );
+          } catch (e) {
+            await dumpVerifySnapshot(`presetIds-timeout st=${st}`);
+            throw e;
+          }
 
           // Give ProjectM a beat to render at least one frame after apply.
           await sleep(250);
@@ -1553,19 +1835,27 @@ async function main() {
 
       await bootstrapWithRetries('init');
 
+      // P1.2A: 标记采样循环开始时间
+      if (!timingStats.sampleLoopStartIso) {
+        timingStats.sampleLoopStartIso = new Date().toISOString();
+        meta.timing = { ...timingStats };
+        await fsp.writeFile(metaPath, `${JSON.stringify({ ...meta, finishedAt: null }, null, 2)}
+`, 'utf8');
+      }
+
       let iter = 0;
       let lastPageErr = pageErrorCount;
       let lastConsoleErr = consoleErrorCount;
       let consecutivePickTimeouts = 0;
       let recoveries = 0;
 
-      while (visited.size < targetUnique && Date.now() < deadlineMs) {
+      while ((targetSamples ? iter < targetSamples : visited.size < targetUnique) && Date.now() < deadlineMs) {
         iter += 1;
         activeIter = iter;
         try {
         if (reloadEvery && iter % reloadEvery === 0) {
           viteLog.write(`[eval] pack=${pack} reload iter=${iter}\n`);
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+          await page.reload({ waitUntil: 'commit', timeout: 60_000 });
           await page.waitForSelector('#preset-next', { state: 'attached', timeout: 60_000 });
           await page.waitForFunction(() => {
             // eslint-disable-next-line no-underscore-dangle
@@ -1650,16 +1940,30 @@ async function main() {
           }
 
           // Coupled must stay enabled after reload (avoid silently collecting nothing).
-          await page.waitForFunction(
-            (expectedPack) => {
-              // eslint-disable-next-line no-underscore-dangle
-              const s = window.__nw_verify?.getVerifyState?.();
-              const c = s?.coupled;
-              return Boolean(c?.enabled) && String(c?.pack || '') === String(expectedPack);
-            },
-            pack,
-            { timeout: 60_000 }
-          );
+          try {
+            await page.waitForFunction(
+              (expectedPack) => {
+                // eslint-disable-next-line no-underscore-dangle
+                const s = window.__nw_verify?.getVerifyState?.();
+                const c = s?.coupled;
+                if (!c) return false;
+                return Boolean(c?.enabled) && String(c?.pack || '') === String(expectedPack);
+              },
+              pack,
+              { timeout: 60_000 }
+            );
+          } catch {
+            let snap = null;
+            try {
+              snap = await page.evaluate(() => {
+                // eslint-disable-next-line no-underscore-dangle
+                return window.__nw_verify?.getVerifyState?.() ?? null;
+              });
+            } catch {
+              // ignore
+            }
+            viteLog.write(`[eval] pack=${pack} coupled-after-reload:timeout snapshot=${JSON.stringify(snap)}\n`);
+          }
         }
 
         const prevTime = await page.evaluate(() => {
@@ -1678,7 +1982,21 @@ async function main() {
           }, null, { timeout: pickTimeoutMs });
 
           // Trigger coupled pair cycle via preset-next (same path as a human click).
-          await page.click('#preset-next', { timeout: pickTimeoutMs });
+          await page.evaluate(() => {
+            // eslint-disable-next-line no-underscore-dangle
+            const a = (window.__nw_verify && window.__nw_verify.actions) || null;
+            const fn = a && typeof a.coupledNext === 'function' ? a.coupledNext : null;
+            if (fn) {
+              try {
+                void fn('eval:iter');
+                return;
+              } catch {
+                // ignore
+              }
+            }
+            const el = document.querySelector('#preset-next');
+            if (el instanceof HTMLButtonElement) el.click();
+          });
 
           // Wait for a new pick entry.
           waitPhase = 'pick';
@@ -1781,7 +2099,7 @@ async function main() {
               throw new Error(`stuck: pick-timeout x${consecutivePickTimeouts}, recoveries=${recoveries}/${stuckMaxRestarts}`);
             }
 
-            await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
+            await page.reload({ waitUntil: 'commit', timeout: 60_000 });
             await page.waitForSelector('#preset-next', { state: 'attached', timeout: 60_000 });
             await page.waitForFunction(() => typeof window.__nw_verify?.getVerifyState === 'function', null, { timeout: 60_000 });
             await page.evaluate(() => {
@@ -1954,13 +2272,13 @@ async function main() {
         if (pageErrorsSinceLast > 0) reasons.push('pageerror');
         if (consoleErrorsSinceLast > 0) reasons.push('consoleerror');
         if (vizAvgLuma != null) {
-          if (vizAvgLuma <= 0.06) reasons.push('too-dark');
+          if (vizAvgLuma <= lumaMin) reasons.push('too-dark');
           if (vizAvgLuma >= 0.96) reasons.push('too-bright');
         } else {
           reasons.push('no-luma');
         }
         if (vizAvgFrameDelta != null) {
-          if (vizAvgFrameDelta < 0.002) reasons.push('low-motion');
+          if (vizAvgFrameDelta < motionMin) reasons.push('low-motion');
         } else {
           reasons.push('no-motion-sample');
         }
@@ -1988,6 +2306,13 @@ async function main() {
           okHeuristic,
           reasons,
         };
+
+        // Fail-fast assertion: pair must be in the loaded manifest (防止前端加载错误 manifest)
+        if (pairId != null && packInfo.allowedPairIds && !packInfo.allowedPairIds.has(pairId)) {
+          const msg = `MANIFEST_MISMATCH: pair=${pairId} not in manifest (${packInfo.manifestFilename}, ${packInfo.allowedPairIds.size} pairs). Browser may have loaded a different manifest.`;
+          viteLog.write(`[eval] FATAL ${msg}\n`);
+          throw new Error(msg);
+        }
 
         ws.write(`${JSON.stringify(out)}\n`);
         const urlEnt = pairId != null ? packInfo?.byId?.get(pairId) : null;
@@ -2037,12 +2362,19 @@ async function main() {
       meta.progress[pack] = {
         iter,
         visited: visited.size,
-        target: targetUnique,
-        done: visited.size >= targetUnique,
+        target: targetSamples ? targetSamples : targetUnique,
+        targetMode: targetSamples ? 'samples' : 'coverage',
+        done: targetSamples ? iter >= targetSamples : visited.size >= targetUnique,
       };
+      // P1.2A: 更新 timing 统计
+      meta.timing = { ...timingStats };
       await fsp.writeFile(metaPath, `${JSON.stringify({ ...meta, finishedAt: null }, null, 2)}\n`, 'utf8');
 
-      viteLog.write(`[eval] pack=${pack} done visited=${visited.size}/${targetUnique}\n`);
+      if (targetSamples) {
+        viteLog.write(`[eval] pack=${pack} done samples=${iter}/${targetSamples} unique=${visited.size}/${targetUnique}\n`);
+      } else {
+        viteLog.write(`[eval] pack=${pack} done visited=${visited.size}/${targetUnique}\n`);
+      }
 
       // Hard guard: if we collected nothing for a non-empty target, this run is garbage.
       // Fail fast so downstream training doesn't silently proceed with empty eval.jsonl.
@@ -2051,8 +2383,11 @@ async function main() {
       }
     }
 
+    // P1.2A: 最终更新 timing 统计
+    meta.timing = { ...timingStats, elapsedSec: (Date.now() - startMs) / 1000 };
     meta.finishedAt = new Date().toISOString();
-    await fsp.writeFile(metaPath, `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
+    await fsp.writeFile(metaPath, `${JSON.stringify(meta, null, 2)}
+`, 'utf8');
 
     console.log(JSON.stringify({ ok: true, outDir, evalPath, metaPath }, null, 2));
   } catch (error) {

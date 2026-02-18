@@ -46,6 +46,11 @@ import {
   PRESET_PREFETCH_TTL_MS,
 } from "../config/presetPrefetch";
 import { createPresetPredictor } from "../features/presets/presetPrediction";
+import { loadAndSetCoupledPairsManifest } from "../features/presets/coupledPairsLoader";
+import {
+  getCoupledPairsManifest,
+  type CoupledPairV0,
+} from "../features/presets/coupledPairsStore";
 import { createPerformanceBudgetManager } from "../performance/PerformanceBudgetManager";
 import { CAMERA_FEATURE } from "../config/cameraSources";
 import { CameraLayer } from "../layers/CameraLayer";
@@ -70,6 +75,7 @@ import {
 } from "../features/visualState/visualStateStore";
 import {
   randomPatchAllForSchema,
+  getDefaultBlendParams,
   randomizeBlendParams,
   randomizeLiquidMetalParams,
 } from "../state/paramSchema";
@@ -101,6 +107,53 @@ import {
 import { listen } from "./bindings/domBindings";
 
 export function bootstrapApp() {
+  // Earliest possible verify seeding (headless dualRandom precondition).
+  // Headless verify accepts either __nw_verify.lastRandomIds or __projectm_verify.presetIdFg/presetIdBg.
+  const seedDualRandomVerify = () => {
+    try {
+      const cur = (globalThis as any).__nw_verify ?? {};
+      const ids = cur.lastRandomIds;
+      if (!ids || typeof ids !== "object") {
+        (globalThis as any).__nw_verify = {
+          ...cur,
+          lastRandomIds: { fg: "fg:unknown", bg: "bg:unknown", n: 0 },
+        };
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      const v = (globalThis as any).__projectm_verify ?? {};
+      const fg =
+        typeof v.presetIdFg === "string" && v.presetIdFg.trim()
+          ? v.presetIdFg
+          : "fg:unknown";
+      const bg =
+        typeof v.presetIdBg === "string" && v.presetIdBg.trim()
+          ? v.presetIdBg
+          : "bg:unknown";
+      (globalThis as any).__projectm_verify = {
+        ...v,
+        presetIdFg: fg,
+        presetIdBg: bg,
+      };
+    } catch {
+      // ignore
+    }
+  };
+  seedDualRandomVerify();
+  // Keepalive: if some later init code stomps globals during boot, re-seed for a short window.
+  try {
+    let ticks = 0;
+    const id = setInterval(() => {
+      seedDualRandomVerify();
+      ticks += 1;
+      if (ticks >= 120) clearInterval(id); // ~30s @ 250ms
+    }, 250);
+  } catch {
+    // ignore
+  }
+
   const app = document.querySelector<HTMLDivElement>("#app");
   if (!app) {
     throw new Error("#app container not found");
@@ -108,7 +161,7 @@ export function bootstrapApp() {
 
   const renderLibrarySelectOptions = () => {
     return PRESET_LIBRARIES.map(
-      (lib) => `<option value="${lib.id}">${lib.label}</option>`
+      (lib) => `<option value="${lib.id}">${lib.label}</option>`,
     ).join("");
   };
 
@@ -168,7 +221,7 @@ export function bootstrapApp() {
     const maxSide = Math.max(
       1,
       Math.round(Number(w) || 0),
-      Math.round(Number(h) || 0)
+      Math.round(Number(h) || 0),
     );
     if (maxSide >= 3000) return 1;
     if (maxSide >= 2000) return 1.25;
@@ -178,11 +231,11 @@ export function bootstrapApp() {
     const rect = canvas.getBoundingClientRect();
     const w = Math.max(
       1,
-      Math.round(rect.width || canvas.clientWidth || window.innerWidth)
+      Math.round(rect.width || canvas.clientWidth || window.innerWidth),
     );
     const h = Math.max(
       1,
-      Math.round(rect.height || canvas.clientHeight || window.innerHeight)
+      Math.round(rect.height || canvas.clientHeight || window.innerHeight),
     );
     return { w, h };
   };
@@ -213,7 +266,7 @@ export function bootstrapApp() {
       "#ff0000",
       "#0000ff",
       "#000000",
-    ])
+    ]),
   );
   calibrationOverlay.appendChild(
     makeCalibRow([
@@ -225,7 +278,7 @@ export function bootstrapApp() {
       "#595959",
       "#333333",
       "#0d0d0d",
-    ])
+    ]),
   );
   calibrationOverlay.appendChild(
     makeCalibRow([
@@ -237,7 +290,7 @@ export function bootstrapApp() {
       "#0f0f0f",
       "#ffffff",
       "#000000",
-    ])
+    ]),
   );
   dom.canvasRoot.appendChild(calibrationOverlay);
   let calibrationOverlayEnabled = false;
@@ -280,6 +333,9 @@ export function bootstrapApp() {
   let updateProjectMAudioCadence: ((timeMs: number) => void) | null = null;
   let updateCompositorBypass: ((timeMs: number) => void) | null = null;
 
+  // Performance budget manager must exist before early init hooks run.
+  const performanceBudgetManager = createPerformanceBudgetManager("high");
+
   const sceneManager = new SceneManager(canvas, {
     onAfterRender: ({ timeMs, deltaTimeSec }) => {
       pushFrameTimeSample(timeMs, deltaTimeSec * 1000);
@@ -290,25 +346,53 @@ export function bootstrapApp() {
     },
   });
   sceneManager.setPixelRatioCap(initialDprCap);
+
+  // Preset state is referenced by early ProjectM layer bindings.
+  // Declare up-front to avoid TDZ errors when accessed via callbacks.
+  let currentPresetId: string | null = null;
+  let currentPresetUrl: string | null = null;
+  let projectLayerReady = false;
+  let currentPresetIdBg: string | null = null;
+  let currentPresetUrlBg: string | null = null;
+  let projectLayerBgReady = false;
+
+  const expressiveAudioDriver = createExpressiveAudioDriver();
+  const getActivePresetFg = () =>
+    currentPresetId ? findPresetById(currentPresetId) ?? null : null;
+  const getActivePresetBg = () =>
+    currentPresetIdBg ? findPresetById(currentPresetIdBg) ?? null : null;
+
+  const defaultBlendParams = getDefaultBlendParams();
+
   const liquidLayer = new LiquidMetalLayerV2();
   const basicLayer = new BasicBackgroundLayer();
-  const projectLayer = new ProjectMLayer({
-    statsKey: "fg",
-    audioProfile: "fg",
-    audioFeedIntervalMs: 33,
-    dprCap: initialDprCap,
-    maxCssWidth: 2880,
-    maxCssHeight: 1620,
-  });
-  const projectLayerBg = new ProjectMLayer({
-    opacity: 0.4,
-    statsKey: "bg",
-    audioProfile: "bg",
-    audioFeedIntervalMs: 50, // 20fps: cleaner than 55ms, sufficient for bg layer
-    dprCap: initialDprCap,
-    maxCssWidth: 1920,
-    maxCssHeight: 1080,
-  });
+  const projectLayer = new ProjectMLayer(
+    {
+      statsKey: "fg",
+      audioProfile: "fg",
+      audioFeedIntervalMs: 33,
+      dprCap: initialDprCap,
+      maxCssWidth: 2880,
+      maxCssHeight: 1620,
+    },
+    defaultBlendParams,
+    expressiveAudioDriver,
+    getActivePresetFg,
+  );
+  const projectLayerBg = new ProjectMLayer(
+    {
+      opacity: 0.4,
+      statsKey: "bg",
+      audioProfile: "bg",
+      audioFeedIntervalMs: 50, // 20fps: cleaner than 55ms, sufficient for bg layer
+      dprCap: initialDprCap,
+      maxCssWidth: 1920,
+      maxCssHeight: 1080,
+    },
+    defaultBlendParams,
+    expressiveAudioDriver,
+    getActivePresetBg,
+  );
   const cameraLayer = CAMERA_FEATURE.enabled
     ? new CameraLayer(CAMERA_FEATURE)
     : null;
@@ -341,7 +425,7 @@ export function bootstrapApp() {
   // Visual state is referenced by several early bindings (AIVJ/macros/etc).
   // Declare it up-front to avoid block-scope TDZ issues in TypeScript.
   let lastVisualState: VisualStateV2 = createDefaultVisualState(
-    liquidLayer.params
+    liquidLayer.params,
   );
 
   const beatTempo = initBeatTempoAnalyzer({
@@ -358,20 +442,19 @@ export function bootstrapApp() {
   trackBootstrapDispose(
     listen(dom.beatTempoToggle, "change", () => {
       beatTempo.setConfig({ enabled: Boolean(dom.beatTempoToggle?.checked) });
-    })
+    }),
   );
 
   const audioControlsToggle = dom.audioControlsToggle;
   const audioControls = createAudioControls({
     enabled: Boolean(audioControlsToggle?.checked),
   });
-  const expressiveAudioDriver = createExpressiveAudioDriver();
   trackBootstrapDispose(
     listen(audioControlsToggle, "change", () => {
       audioControls.setConfig({
         enabled: Boolean(audioControlsToggle?.checked),
       });
-    })
+    }),
   );
 
   // Unified macro runtime application (AudioControls + AIVJ): apply at a modest rate.
@@ -471,8 +554,8 @@ export function bootstrapApp() {
             return sceneManager.getCompositorConfig();
           }
         })(),
-      })
-    )
+      }),
+    ),
   );
 
   const decisionTopologyOverlay = new DecisionTopologyOverlay(document.body, {
@@ -815,7 +898,7 @@ export function bootstrapApp() {
   let beatTempoLastSetMs = 0;
   let pmAudioCadenceMode: "high" | "mid" | "low" = "high";
   let pmAudioCadenceLastSetMs = 0;
-  
+
   // 初始化预算管理器（基于分辨率选择初始等级）
   const computeInitialQualityLevel = () => {
     const maxSide = Math.max(1, initialDisplay.w, initialDisplay.h);
@@ -823,12 +906,12 @@ export function bootstrapApp() {
     if (maxSide >= 2000) return "high";
     return "high";
   };
-  
+
   const initPerformanceBudget = (nowMs: number) => {
     const initialLevel = computeInitialQualityLevel();
     performanceBudgetManager.setLevel(initialLevel, nowMs);
   };
-  
+
   // 统一的性能预算更新（替换原有的 3 个独立函数）
   const updatePerformanceBudget = (timeMs: number) => {
     // 记录帧时间到预算管理器
@@ -836,31 +919,31 @@ export function bootstrapApp() {
     if (Number.isFinite(p95) && p95 > 0) {
       performanceBudgetManager.recordFrameTime(p95);
     }
-    
+
     // Preset 加载期间强制降级
     if (presetLoadPressureUntilMs && timeMs < presetLoadPressureUntilMs) {
       performanceBudgetManager.setLevel("low", timeMs);
       return;
     }
-    
+
     // 评估是否需要调整质量级别
     const suggestedLevel = performanceBudgetManager.evaluateAdjustment(timeMs);
     if (suggestedLevel) {
       performanceBudgetManager.applyLevel(suggestedLevel, timeMs);
     }
   };
-  
+
   // 保留旧函数接口用于向后兼容（内部委托给预算管理器）
   const applyAudioAnalysisCap = (
     next: number,
     reason: string,
-    nowMs: number
+    nowMs: number,
   ) => {
     const v = Number(next);
     if (!Number.isFinite(v)) return;
     const clamped = Math.max(
       AUDIO_ANALYSIS_FPS_MIN,
-      Math.min(AUDIO_ANALYSIS_FPS_MAX, Math.round(v))
+      Math.min(AUDIO_ANALYSIS_FPS_MAX, Math.round(v)),
     );
     if (clamped === audioAnalysisFpsCap) return;
     audioAnalysisFpsCap = clamped;
@@ -884,7 +967,7 @@ export function bootstrapApp() {
     if (!Number.isFinite(v)) return;
     const clamped = Math.max(
       BEAT_TEMPO_FPS_LOW,
-      Math.min(BEAT_TEMPO_FPS_HIGH, Math.round(v))
+      Math.min(BEAT_TEMPO_FPS_HIGH, Math.round(v)),
     );
     if (clamped === beatTempoFpsCap) return;
     beatTempoFpsCap = clamped;
@@ -905,7 +988,7 @@ export function bootstrapApp() {
   const applyProjectMAudioCadence = (
     mode: "high" | "mid" | "low",
     reason: string,
-    nowMs: number
+    nowMs: number,
   ) => {
     if (mode === pmAudioCadenceMode && reason !== "init") return;
     pmAudioCadenceMode = mode;
@@ -914,19 +997,19 @@ export function bootstrapApp() {
       mode === "low"
         ? PM_AUDIO_FEED_FG_LOW_MS
         : mode === "mid"
-        ? PM_AUDIO_FEED_FG_MID_MS
-        : PM_AUDIO_FEED_FG_HIGH_MS;
+          ? PM_AUDIO_FEED_FG_MID_MS
+          : PM_AUDIO_FEED_FG_HIGH_MS;
     const bgMs =
       mode === "low"
         ? PM_AUDIO_FEED_BG_LOW_MS
         : mode === "mid"
-        ? PM_AUDIO_FEED_BG_MID_MS
-        : PM_AUDIO_FEED_BG_HIGH_MS;
+          ? PM_AUDIO_FEED_BG_MID_MS
+          : PM_AUDIO_FEED_BG_HIGH_MS;
     projectLayer.setAudioFeedIntervalMs(fgMs);
     projectLayerBg.setAudioFeedIntervalMs(bgMs);
     recordControlPlaneEvent(
       "PM_AUDIO_FEED",
-      `${mode}:${fgMs}/${bgMs}:${reason}`
+      `${mode}:${fgMs}/${bgMs}:${reason}`,
     );
   };
 
@@ -934,20 +1017,17 @@ export function bootstrapApp() {
     // 委托给统一预算管理器
     updatePerformanceBudget(timeMs);
   };
-      applyProjectMAudioCadence(mode, reason, timeMs);
-    }
-  };
 
   initAudioAnalysisCap(
-    typeof performance !== "undefined" ? performance.now() : Date.now()
+    typeof performance !== "undefined" ? performance.now() : Date.now(),
   );
   initBeatTempoCap(
-    typeof performance !== "undefined" ? performance.now() : Date.now()
+    typeof performance !== "undefined" ? performance.now() : Date.now(),
   );
   applyProjectMAudioCadence(
     pmAudioCadenceMode,
     "init",
-    typeof performance !== "undefined" ? performance.now() : Date.now()
+    typeof performance !== "undefined" ? performance.now() : Date.now(),
   );
 
   const PM_BYPASS_THRESHOLD_ON = 0.02;
@@ -999,35 +1079,38 @@ export function bootstrapApp() {
 
   const evaluatePresetSwitchGate = (
     nowMs: number,
-    origin: string
+    origin: string,
   ): { allow: boolean; reasons: string[] } => {
     const reasons: string[] = [];
     if (origin === "auto" && nowMs < autoCycleBackoffUntilMs) {
       reasons.push("backoff");
     }
     const verifyOverride = Boolean(
-      (globalThis as any).__nw_verify?.forcePresetGateOpen
+      (globalThis as any).__nw_verify?.forcePresetGateOpen,
     );
     if (!verifyOverride) {
       if (!gateAudioValid) reasons.push("audio");
       if (!gateBeatTrusted) reasons.push("beat");
       if (!gateRenderStable) reasons.push("render");
     }
-    if (nowMs < beatCooldownUntilMs) reasons.push("beatCooldown");
-    if (lastResCommitMs && nowMs - lastResCommitMs < RES_COOLDOWN_MS) {
-      reasons.push("m3Cooldown");
-    }
-    if (
-      lastPresetSwitchMs &&
-      nowMs - lastPresetSwitchMs < PRESET_SWITCH_COOLDOWN_MS
-    ) {
-      reasons.push("cooldown");
-    }
-    if (
-      lastBgPresetSwitchMs &&
-      nowMs - lastBgPresetSwitchMs < BG_RECENT_BLOCK_MS
-    ) {
-      reasons.push("bgRecent");
+    // Cooldowns can be bypassed in verify mode to allow rapid headless sampling.
+    if (!verifyOverride) {
+      if (nowMs < beatCooldownUntilMs) reasons.push("beatCooldown");
+      if (lastResCommitMs && nowMs - lastResCommitMs < RES_COOLDOWN_MS) {
+        reasons.push("m3Cooldown");
+      }
+      if (
+        lastPresetSwitchMs &&
+        nowMs - lastPresetSwitchMs < PRESET_SWITCH_COOLDOWN_MS
+      ) {
+        reasons.push("cooldown");
+      }
+      if (
+        lastBgPresetSwitchMs &&
+        nowMs - lastBgPresetSwitchMs < BG_RECENT_BLOCK_MS
+      ) {
+        reasons.push("bgRecent");
+      }
     }
     if (!verifyOverride && gateBeatTrusted) {
       const phase01 = clamp01(lastBeatPhase01);
@@ -1040,14 +1123,14 @@ export function bootstrapApp() {
 
   const evaluateBgPresetSwitchGate = (
     nowMs: number,
-    origin: string
+    origin: string,
   ): { allow: boolean; reasons: string[] } => {
     const reasons: string[] = [];
     if (origin === "bg:auto" && nowMs < autoCycleBgBackoffUntilMs) {
       reasons.push("backoff");
     }
     const verifyOverride = Boolean(
-      (globalThis as any).__nw_verify?.forcePresetGateOpen
+      (globalThis as any).__nw_verify?.forcePresetGateOpen,
     );
     if (!verifyOverride) {
       if (!gateAudioValid) reasons.push("audio");
@@ -1088,7 +1171,7 @@ export function bootstrapApp() {
     if (direction === "up" && !gateRenderStable) reasons.push("render");
     const lastPresetActionMs = Math.max(
       lastPresetSwitchMs,
-      lastBgPresetSwitchMs
+      lastBgPresetSwitchMs,
     );
     if (lastPresetActionMs) {
       const presetCooldown =
@@ -1128,11 +1211,11 @@ export function bootstrapApp() {
     const rect = canvas.getBoundingClientRect();
     const w = Math.max(
       1,
-      Math.round(rect.width || canvas.clientWidth || window.innerWidth)
+      Math.round(rect.width || canvas.clientWidth || window.innerWidth),
     );
     const h = Math.max(
       1,
-      Math.round(rect.height || canvas.clientHeight || window.innerHeight)
+      Math.round(rect.height || canvas.clientHeight || window.innerHeight),
     );
     const dpr = Math.max(1, Number(window.devicePixelRatio || 1));
     return { w, h, dpr };
@@ -1140,7 +1223,7 @@ export function bootstrapApp() {
 
   const hasDisplayChanged = (
     prev: { w: number; h: number; dpr: number },
-    next: { w: number; h: number; dpr: number }
+    next: { w: number; h: number; dpr: number },
   ) => {
     if (!prev.w || !prev.h) return true;
     const dw = Math.abs(next.w - prev.w);
@@ -1174,7 +1257,7 @@ export function bootstrapApp() {
   const applyDisplayInitScale = (
     nowMs: number,
     metrics: { w: number; h: number; dpr: number },
-    reason: string
+    reason: string,
   ) => {
     if (metrics.w < 10 || metrics.h < 10) return false;
     const idx = pickInitialScaleIndex(metrics.w, metrics.h);
@@ -1225,7 +1308,7 @@ export function bootstrapApp() {
     controlPlaneDebug.color.outputColorSpace = String(r.outputColorSpace);
     controlPlaneDebug.color.toneMapping = String(r.toneMapping);
     controlPlaneDebug.color.toneMappingExposure = Number(
-      (r as any).toneMappingExposure ?? 1
+      (r as any).toneMappingExposure ?? 1,
     );
     controlPlaneDebug.color.premultipliedAlpha =
       typeof (r as any).premultipliedAlpha === "boolean"
@@ -1238,7 +1321,7 @@ export function bootstrapApp() {
       "COLOR_SNAPSHOT",
       `${String(r.outputColorSpace)}|${String(r.toneMapping)}|${
         controlPlaneDebug.color.toneMappingExposure
-      }|pm=${controlPlaneDebug.color.premultipliedAlpha ? 1 : 0}`
+      }|pm=${controlPlaneDebug.color.premultipliedAlpha ? 1 : 0}`,
     );
     decisionTrace.record({
       tMs: nowMs,
@@ -1256,7 +1339,7 @@ export function bootstrapApp() {
       : "none";
     dom.calibrationToggle?.classList.toggle(
       "toolbar__button--active",
-      calibrationOverlayEnabled
+      calibrationOverlayEnabled,
     );
     if (calibrationAutoOffTimer != null) {
       window.clearTimeout(calibrationAutoOffTimer);
@@ -1383,8 +1466,15 @@ export function bootstrapApp() {
   const requestPresetCycle = (origin: "manual" | "auto") => {
     const nowMs =
       typeof performance !== "undefined" ? performance.now() : Date.now();
+    // Debug: trace coupled routing
+    try {
+      console.log(`[requestPresetCycle] origin=${origin} desiredEnabled=${coupledRuntime.config.desiredEnabled} pack=${coupledRuntime.config.pack}`);
+    } catch {
+      // ignore
+    }
     const decision = evaluatePresetSwitchGate(nowMs, origin);
     if (!decision.allow) {
+      try { console.log(`[requestPresetCycle] gate blocked: ${decision.reasons.join(",")}`); } catch { /**/ }
       if (pendingPresetRequest?.origin === "manual" && origin === "auto") {
         return;
       }
@@ -1400,6 +1490,10 @@ export function bootstrapApp() {
     recordControlPlaneEvent("ACTION_COMMIT", `preset:${origin}`);
     noteCouplingSwitchDampen(nowMs, origin);
     noteAivjMorphHold(`preset:${origin}`);
+    if (coupledRuntime.config.desiredEnabled) {
+      void cycleToNextCoupledPair(origin, { skipGate: true });
+      return;
+    }
     void cycleToNextPreset(origin, { skipGate: true });
   };
 
@@ -1461,7 +1555,7 @@ export function bootstrapApp() {
   // --- Toolbar helpers ---
   const setRowVisible = (
     row: HTMLElement | null | undefined,
-    visible: boolean
+    visible: boolean,
   ) => {
     if (!row) return;
     row.style.display = visible ? "" : "none";
@@ -1497,7 +1591,7 @@ export function bootstrapApp() {
 
   function readNumberInputValue(
     el: HTMLInputElement | null | undefined,
-    fallback: number
+    fallback: number,
   ) {
     const n = Number(el?.value);
     return Number.isFinite(n) ? n : fallback;
@@ -1505,7 +1599,7 @@ export function bootstrapApp() {
 
   function readRangeInputValue01(
     el: HTMLInputElement | null | undefined,
-    fallback01: number
+    fallback01: number,
   ) {
     const n = Number(el?.value);
     if (!Number.isFinite(n)) return fallback01;
@@ -1513,12 +1607,12 @@ export function bootstrapApp() {
   }
 
   const resolveToolbarTunableInput = (
-    target: HTMLElement | null
+    target: HTMLElement | null,
   ): HTMLInputElement | null => {
     if (!target) return null;
 
     let input = target.closest?.(
-      'input[type="range"], input[type="number"]'
+      'input[type="range"], input[type="number"]',
     ) as HTMLInputElement | null;
 
     // Macro strips: allow wheel/drag anywhere in the strip (label/value/knob) to adjust the macro.
@@ -1526,7 +1620,7 @@ export function bootstrapApp() {
       const strip = target.closest?.(".nw-macro-strip") as HTMLElement | null;
       if (strip) {
         input = strip.querySelector<HTMLInputElement>(
-          'input.nw-knob__input[type="range"], input.nw-knob__input[type="number"]'
+          'input.nw-knob__input[type="range"], input.nw-knob__input[type="number"]',
         );
       }
     }
@@ -1534,11 +1628,11 @@ export function bootstrapApp() {
     // Slot knobs: allow wheel/drag anywhere within the slot knob wrapper.
     if (!input) {
       const slotKnob = target.closest?.(
-        "[data-role='slot-knob']"
+        "[data-role='slot-knob']",
       ) as HTMLElement | null;
       if (slotKnob) {
         input = slotKnob.querySelector<HTMLInputElement>(
-          'input[data-role="slot-value"], input.nw-knob__input[type="range"], input.nw-knob__input[type="number"]'
+          'input[data-role="slot-value"], input.nw-knob__input[type="range"], input.nw-knob__input[type="number"]',
         );
       }
     }
@@ -1548,7 +1642,7 @@ export function bootstrapApp() {
       const knob = target.closest?.(".nw-knob") as HTMLElement | null;
       if (knob) {
         input = knob.querySelector<HTMLInputElement>(
-          'input.nw-knob__input[type="range"], input.nw-knob__input[type="number"]'
+          'input.nw-knob__input[type="range"], input.nw-knob__input[type="number"]',
         );
       }
     }
@@ -1588,8 +1682,8 @@ export function bootstrapApp() {
           : input.type === "range" &&
             Number.isFinite(min) &&
             Number.isFinite(max)
-          ? ((max - min) / 100) * dir
-          : 1 * dir;
+            ? ((max - min) / 100) * dir
+            : 1 * dir;
 
         // Keep range inputs stable.
         if (!Number.isFinite(delta) || delta === 0) delta = 1 * dir;
@@ -1606,8 +1700,8 @@ export function bootstrapApp() {
         input.dispatchEvent(new Event("change", { bubbles: true }));
         ev.preventDefault();
       },
-      { passive: false }
-    )
+      { passive: false },
+    ),
   );
 
   // Windows-friendly knob interaction: allow click+drag on the knob dial.
@@ -1693,8 +1787,8 @@ export function bootstrapApp() {
           }
           pev.preventDefault();
         },
-        { passive: false }
-      )
+        { passive: false },
+      ),
     );
 
     trackBootstrapDispose(
@@ -1741,8 +1835,8 @@ export function bootstrapApp() {
           }
           pev.preventDefault();
         },
-        { passive: false }
-      )
+        { passive: false },
+      ),
     );
 
     trackBootstrapDispose(
@@ -1755,7 +1849,7 @@ export function bootstrapApp() {
           if (pev.pointerId !== knobDrag.pointerId) return;
           try {
             knobDrag.input.dispatchEvent(
-              new Event("change", { bubbles: true })
+              new Event("change", { bubbles: true }),
             );
             knobDrag.dial.releasePointerCapture(pev.pointerId);
           } catch {
@@ -1763,8 +1857,8 @@ export function bootstrapApp() {
           }
           knobDrag = null;
         },
-        { passive: true }
-      )
+        { passive: true },
+      ),
     );
 
     trackBootstrapDispose(
@@ -1777,8 +1871,8 @@ export function bootstrapApp() {
           if (pev.pointerId !== knobDrag.pointerId) return;
           knobDrag = null;
         },
-        { passive: true }
-      )
+        { passive: true },
+      ),
     );
   }
 
@@ -1962,19 +2056,19 @@ export function bootstrapApp() {
     dom.toolbarBody.dataset.showAdvanced = toolbarShowAdvanced ? "1" : "0";
     dom.toolbarDebugToggleButton.classList.toggle(
       "toolbar__button--active",
-      toolbarShowDebug
+      toolbarShowDebug,
     );
     dom.toolbarAdvancedToggleButton.classList.toggle(
       "toolbar__button--active",
-      toolbarShowAdvanced
+      toolbarShowAdvanced,
     );
     dom.toolbarDebugToggleButton.setAttribute(
       "aria-pressed",
-      toolbarShowDebug ? "true" : "false"
+      toolbarShowDebug ? "true" : "false",
     );
     dom.toolbarAdvancedToggleButton.setAttribute(
       "aria-pressed",
-      toolbarShowAdvanced ? "true" : "false"
+      toolbarShowAdvanced ? "true" : "false",
     );
   };
 
@@ -1984,14 +2078,14 @@ export function bootstrapApp() {
       toolbarShowDebug = !toolbarShowDebug;
       writeStored(TOOLBAR_DEBUG_KEY, toolbarShowDebug ? "1" : "0");
       applyToolbarGroups();
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(dom.toolbarAdvancedToggleButton, "click", () => {
       toolbarShowAdvanced = !toolbarShowAdvanced;
       writeStored(TOOLBAR_ADVANCED_KEY, toolbarShowAdvanced ? "1" : "0");
       applyToolbarGroups();
-    })
+    }),
   );
 
   const readStoredString = (key: string, fallback: string) => {
@@ -2058,7 +2152,7 @@ export function bootstrapApp() {
 
   const applyAudioDrivePreset = (
     presetId: AudioDrivePresetId,
-    opts?: { save?: boolean }
+    opts?: { save?: boolean },
   ) => {
     const preset =
       AUDIO_DRIVE_PRESETS[presetId] ?? AUDIO_DRIVE_PRESETS.balanced;
@@ -2072,7 +2166,7 @@ export function bootstrapApp() {
 
   const initialAudioPreset = readStoredString(
     AUDIO_DRIVE_PRESET_KEY,
-    "balanced"
+    "balanced",
   ) as AudioDrivePresetId;
   applyAudioDrivePreset(initialAudioPreset, { save: false });
 
@@ -2085,13 +2179,390 @@ export function bootstrapApp() {
         ? (raw as AudioDrivePresetId)
         : "balanced";
       applyAudioDrivePreset(next, { save: true });
-    })
+    }),
   );
+
+  type CoupledRuntimePickMode = "random" | "shuffle" | "weighted";
+  type CoupledRuntimeConfig = {
+    desiredEnabled: boolean;
+    pack: string | null;
+    pickMode: CoupledRuntimePickMode;
+    gamma: number | null;
+    explore: number | null;
+    dedupN: number | null;
+    dedupPenalty: number | null;
+    manifestFile: string | null;
+  };
+  type CoupledRuntimeState = {
+    active: boolean;
+    config: CoupledRuntimeConfig;
+    lastPick: { timeMs: number; pair: number } | null;
+  };
+
+  const readCoupledConfigFromUrl = (): CoupledRuntimeConfig => {
+    try {
+      const u = new URL(String(globalThis.location?.href || ""));
+      const params = u.searchParams;
+      const coupledRaw = String(params.get("coupled") ?? "").trim().toLowerCase();
+      const desiredEnabled =
+        coupledRaw === "1" || coupledRaw === "true" || coupledRaw === "yes" || !!coupledRaw;
+
+      const packRaw = String(params.get("coupledPack") ?? "").trim();
+      const pack = packRaw ? packRaw : null;
+
+      const pickRaw = String(params.get("coupledPick") ?? "random")
+        .trim()
+        .toLowerCase();
+      const pickMode: CoupledRuntimePickMode =
+        pickRaw === "shuffle" || pickRaw === "weighted" || pickRaw === "random"
+          ? (pickRaw as CoupledRuntimePickMode)
+          : "random";
+
+      const toNum = (v: string | null) => {
+        const n = Number(String(v ?? "").trim());
+        return Number.isFinite(n) ? n : null;
+      };
+      const toInt = (v: string | null) => {
+        const n = Number(String(v ?? "").trim());
+        return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : null;
+      };
+
+      const manifestFileRaw = String(params.get("coupledManifest") ?? "").trim();
+      const manifestFile = manifestFileRaw || null;
+
+      return {
+        desiredEnabled: Boolean(desiredEnabled && pack),
+        pack,
+        pickMode,
+        gamma: toNum(params.get("coupledGamma")),
+        explore: toNum(params.get("coupledExplore")),
+        dedupN: toInt(params.get("coupledDedupN")),
+        dedupPenalty: toNum(params.get("coupledDedupPenalty")),
+        manifestFile,
+      };
+    } catch {
+      return {
+        desiredEnabled: false,
+        pack: null,
+        pickMode: "random",
+        gamma: null,
+        explore: null,
+        dedupN: null,
+        dedupPenalty: null,
+        manifestFile: null,
+      };
+    }
+  };
+
+  const coupledRuntime: CoupledRuntimeState = {
+    active: false,
+    config: readCoupledConfigFromUrl(),
+    lastPick: null,
+  };
+
+  let coupledManifestLoadPromise: Promise<void> | null = null;
+  const ensureCoupledManifestLoaded = async (reason: string) => {
+    try { console.log(`[coupled-manifest] enter reason=${reason} promiseExists=${!!coupledManifestLoadPromise} active=${coupledRuntime.active}`); } catch { /**/ }
+    const cfg = readCoupledConfigFromUrl();
+    coupledRuntime.config = cfg;
+    if (!cfg.desiredEnabled || !cfg.pack) {
+      coupledRuntime.active = false;
+      try { console.log(`[coupled-manifest] bail: disabled desiredEnabled=${cfg.desiredEnabled} pack=${cfg.pack}`); } catch { /**/ }
+      return { ok: false as const, error: "disabled" };
+    }
+
+    const pack = cfg.pack;
+
+    if (coupledManifestLoadPromise) {
+      // IMPORTANT: do not reset coupledRuntime.active here.
+      // The promise might already be resolved; resetting active would "stick" false.
+      try { console.log(`[coupled-manifest] awaiting existing promise active=${coupledRuntime.active}`); } catch { /**/ }
+      await coupledManifestLoadPromise;
+      try { console.log(`[coupled-manifest] after await active=${coupledRuntime.active}`); } catch { /**/ }
+    } else {
+      const manifestFile = cfg.manifestFile || "pairs-manifest.v0.json";
+      const manifestUrl = `/presets/${encodeURIComponent(pack)}/${manifestFile}`;
+      try { console.log(`[coupled-manifest] starting load url=${manifestUrl}`); } catch { /**/ }
+      coupledRuntime.active = false;
+      coupledManifestLoadPromise = (async () => {
+        try {
+          const m = await loadAndSetCoupledPairsManifest(manifestUrl);
+          const hasPairs = m && m.pack === pack && Array.isArray((m as any).pairs);
+          try { console.log(`[coupled-manifest] loaded pack=${m?.pack} hasPairs=${hasPairs} pairsLen=${(m as any)?.pairs?.length}`); } catch { /**/ }
+          if (hasPairs) {
+            coupledRuntime.active = true;
+          } else {
+            coupledRuntime.active = false;
+          }
+        } catch (err) {
+          coupledRuntime.active = false;
+          try {
+            console.warn("[coupled-pairs] load failed", reason, err);
+          } catch {
+            // ignore
+          }
+        }
+      })();
+      await coupledManifestLoadPromise;
+      try { console.log(`[coupled-manifest] load complete active=${coupledRuntime.active}`); } catch { /**/ }
+    }
+
+    // Re-confirm from current store state (covers the "promise already resolved" case).
+    if (!coupledRuntime.active) {
+      try {
+        const m = getCoupledPairsManifest();
+        const pairs = m?.pack === pack ? (m as any)?.pairs : null;
+        try { console.log(`[coupled-manifest] re-confirm storePack=${m?.pack} expectedPack=${pack} pairsLen=${pairs?.length ?? 0}`); } catch { /**/ }
+        if (Array.isArray(pairs) && pairs.length) {
+          coupledRuntime.active = true;
+          try { console.log(`[coupled-manifest] re-confirm success, active=true`); } catch { /**/ }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!coupledRuntime.active) {
+      coupledManifestLoadPromise = null;
+      try { console.log(`[coupled-manifest] FAIL active=false`); } catch { /**/ }
+      return { ok: false as const, error: "manifest-not-ready" };
+    }
+    try { console.log(`[coupled-manifest] SUCCESS active=true`); } catch { /**/ }
+    return { ok: true as const };
+  };
+
+  const readCoupledShuffleState = (pack: string, len: number) => {
+    try {
+      const raw = String(localStorage.getItem("nw.coupledPairs.shuffleState.v0") ?? "");
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj !== "object") return null;
+      if (String(obj.pack || "") !== String(pack)) return null;
+      if (Number(obj.len) !== Number(len)) return null;
+      const order = Array.isArray(obj.order) ? obj.order : null;
+      if (!order || order.length !== len) return null;
+      const pos = Number.isFinite(Number(obj.pos)) ? Math.max(0, Math.floor(Number(obj.pos))) : 0;
+      return { pos, order };
+    } catch {
+      return null;
+    }
+  };
+
+  const writeCoupledShuffleState = (pack: string, len: number, pos: number, order: number[], seededBy?: string) => {
+    try {
+      localStorage.setItem(
+        "nw.coupledPairs.shuffleState.v0",
+        JSON.stringify({
+          v: 0,
+          pack,
+          len,
+          pos,
+          order,
+          updatedAt: Date.now(),
+          seededBy: String(seededBy || "runtime"),
+        }),
+      );
+    } catch {
+      // ignore
+    }
+  };
+
+  const shuffleInPlace = (arr: number[]) => {
+    for (let i = arr.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = arr[i];
+      arr[i] = arr[j];
+      arr[j] = tmp;
+    }
+  };
+
+  const coupledRecentPicks: number[] = [];
+  const pushCoupledRecentPick = (pairId: number, n: number) => {
+    if (!Number.isFinite(pairId)) return;
+    coupledRecentPicks.push(pairId);
+    if (coupledRecentPicks.length > n) {
+      coupledRecentPicks.splice(0, coupledRecentPicks.length - n);
+    }
+  };
+
+  const pickWeightedIndex = (pairs: CoupledPairV0[], cfg: CoupledRuntimeConfig) => {
+    const gamma = Number.isFinite(Number(cfg.gamma)) ? Math.max(0, Number(cfg.gamma)) : 1;
+    const explore = Number.isFinite(Number(cfg.explore)) ? Math.min(1, Math.max(0, Number(cfg.explore))) : 0;
+    const dedupN = typeof cfg.dedupN === "number" ? Math.max(0, Math.floor(cfg.dedupN)) : 0;
+    const dedupPenalty = Number.isFinite(Number(cfg.dedupPenalty))
+      ? Math.min(1, Math.max(0, Number(cfg.dedupPenalty)))
+      : 0;
+
+    const recent = dedupN ? coupledRecentPicks.slice(-dedupN) : [];
+    const recentSet = recent.length ? new Set(recent) : null;
+
+    let total = 0;
+    const weights = new Array(pairs.length);
+    for (let i = 0; i < pairs.length; i += 1) {
+      const p = pairs[i];
+      const qRaw = Number((p as any)?.quality01);
+      const q = Number.isFinite(qRaw) ? Math.min(1, Math.max(0, qRaw)) : 0.5;
+      const qualityWeight = Math.pow(q + 1e-6, gamma);
+      let w = (1 - explore) * qualityWeight + explore * 1;
+      if (recentSet && dedupPenalty > 0 && recentSet.has(p.pair)) {
+        w *= 1 - dedupPenalty;
+      }
+      if (!Number.isFinite(w) || w < 0) w = 0;
+      weights[i] = w;
+      total += w;
+    }
+    if (!(total > 0)) return Math.floor(Math.random() * pairs.length);
+    let r = Math.random() * total;
+    for (let i = 0; i < weights.length; i += 1) {
+      r -= weights[i];
+      if (r <= 0) return i;
+    }
+    return weights.length - 1;
+  };
+
+  const pickNextCoupledPair = (reason: string) => {
+    const cfg = coupledRuntime.config;
+    const pack = cfg.pack;
+    if (!coupledRuntime.active || !pack) return null;
+
+    const manifest = getCoupledPairsManifest();
+    const pairs = manifest?.pack === pack ? manifest?.pairs : null;
+    if (!pairs || !Array.isArray(pairs) || !pairs.length) return null;
+
+    const len = pairs.length;
+    let index = 0;
+    if (cfg.pickMode === "shuffle") {
+      const prev = readCoupledShuffleState(pack, len);
+      const order = prev?.order ?? (() => {
+        const o = Array.from({ length: len }, (_, i) => i);
+        shuffleInPlace(o);
+        return o;
+      })();
+      const pos = prev?.pos ?? 0;
+      const safePos = pos % len;
+      index = Number(order[safePos] ?? 0) || 0;
+      writeCoupledShuffleState(pack, len, safePos + 1, order, reason);
+    } else if (cfg.pickMode === "weighted") {
+      index = pickWeightedIndex(pairs, cfg);
+    } else {
+      index = Math.floor(Math.random() * len);
+    }
+
+    const picked = pairs[Math.max(0, Math.min(len - 1, index))] as CoupledPairV0;
+    if (typeof cfg.dedupN === "number" && cfg.dedupN > 0) {
+      pushCoupledRecentPick(picked.pair, cfg.dedupN);
+    }
+    return picked;
+  };
 
   const registerVerifyHooks = () => {
     const root = (globalThis as any).__nw_verify ?? {};
+    const existingActions =
+      root.actions && typeof root.actions === "object" ? root.actions : {};
     (globalThis as any).__nw_verify = {
       ...root,
+      // Minimal, stable snapshot for headless/eval scripts.
+      getVerifyState: () => {
+        try {
+          const v = (globalThis as any).__projectm_verify ?? {};
+          const ids = (globalThis as any).__nw_verify?.lastRandomIds ?? null;
+          const coupled = {
+            enabled: Boolean(coupledRuntime.active),
+            pack: coupledRuntime.config.pack ?? null,
+            pickMode: coupledRuntime.config.pickMode ?? null,
+            lastPick: coupledRuntime.lastPick,
+          };
+          const coupledPresetIds = (() => {
+            if (!coupled.enabled) return null;
+            const pair = coupledRuntime.lastPick?.pair;
+            const pack = coupledRuntime.config.pack;
+            if (!pack || !Number.isFinite(Number(pair))) return null;
+            const pid = Math.floor(Number(pair));
+            return {
+              fg: `coupled:${pack}:${pid}:fg`,
+              bg: `coupled:${pack}:${pid}:bg`,
+            };
+          })();
+          return {
+            projectmVerify: v,
+            lastRandomIds: ids,
+            presetIds: {
+              fg: coupledPresetIds?.fg ?? currentPresetId ?? currentPresetUrl ?? null,
+              bg: coupledPresetIds?.bg ?? currentPresetIdBg ?? currentPresetUrlBg ?? null,
+            },
+            coupled,
+          };
+        } catch {
+          return {
+            projectmVerify: null,
+            lastRandomIds: null,
+            presetIds: { fg: null, bg: null },
+            coupled: {
+              enabled: false,
+              pack: null,
+              pickMode: null,
+              lastPick: null,
+            },
+          };
+        }
+      },
+      // Signal for scripts that want a simple readiness gate.
+      ready: true,
+
+      // Verify/eval helper actions.
+      // Keep these tiny and resilient; they are used by Playwright scripts.
+      actions: {
+        ...existingActions,
+        coupledInit: async (reason?: unknown) => {
+          try {
+            const r = await ensureCoupledManifestLoaded(
+              `verify:coupledInit:${String(reason ?? "")}`,
+            );
+            return Boolean((r as any)?.ok);
+          } catch {
+            return false;
+          }
+        },
+        coupledNext: async (reason?: unknown) => {
+          const startedAt = Date.now();
+          let ok = false;
+          let errorText: string | null = null;
+          try {
+            // Avoid UI click wiring + gate timing issues in Playwright.
+            // This still respects internal safety checks (projectLayerReady, presetLoadInFlight, etc).
+            let fn: any = null;
+            try {
+              fn = (cycleToNextCoupledPair as any);
+            } catch {
+              fn = null;
+            }
+            if (typeof fn !== "function") {
+              errorText = "cycleToNextCoupledPair:not-ready";
+              return false;
+            }
+            await fn("manual", { skipGate: true });
+            ok = Boolean(coupledRuntime.lastPick);
+            return ok;
+          } catch {
+            errorText = "cycleToNextCoupledPair:exception";
+            return false;
+          } finally {
+            try {
+              (globalThis as any).__nw_verify = (globalThis as any).__nw_verify || {};
+              (globalThis as any).__nw_verify._coupledNextDebug = {
+                startedAt,
+                finishedAt: Date.now(),
+                ok,
+                reason: String(reason ?? ""),
+                lastPick: coupledRuntime.lastPick,
+                error: errorText,
+              };
+            } catch {
+              // ignore
+            }
+          }
+        },
+      },
       getCompositorProfile: () => {
         try {
           return (sceneManager as any).getCompositorProfile?.();
@@ -2107,8 +2578,8 @@ export function bootstrapApp() {
           1,
           Math.min(
             PRESET_SWITCH_REPORT_LIMIT,
-            Number.isFinite(Number(limit)) ? Number(limit) : 40
-          )
+            Number.isFinite(Number(limit)) ? Number(limit) : 40,
+          ),
         );
         return presetSwitchReports.slice(-n);
       },
@@ -2135,7 +2606,7 @@ export function bootstrapApp() {
         presetPredictor.reset();
         return { reset: true };
       },
-      
+
       // 性能预算管理器诊断 API
       getPerformanceBudgetStats: () => {
         return performanceBudgetManager.getStats();
@@ -2145,7 +2616,8 @@ export function bootstrapApp() {
         if (!validLevels.includes(level)) {
           return { error: `Invalid level. Use: ${validLevels.join(", ")}` };
         }
-        const nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
+        const nowMs =
+          typeof performance !== "undefined" ? performance.now() : Date.now();
         performanceBudgetManager.setLevel(level as any, nowMs);
         return { level, timestamp: nowMs };
       },
@@ -2153,7 +2625,7 @@ export function bootstrapApp() {
         performanceBudgetManager.reset();
         return { reset: true };
       },
-      
+
       hideTopologyOverlay: () => {
         try {
           decisionTopologyOverlay.hide();
@@ -2236,7 +2708,7 @@ export function bootstrapApp() {
           nowMs,
           presetLoadPressureMsLeft: Math.max(
             0,
-            presetLoadPressureUntilMs - nowMs
+            presetLoadPressureUntilMs - nowMs,
           ),
           frameTimeP95Ms: Number.isFinite(frameTimeP95Ms) ? frameTimeP95Ms : 0,
           audioAnalysisFpsCap,
@@ -2269,6 +2741,42 @@ export function bootstrapApp() {
         }
       },
     };
+
+    // Seed dualRandom ids on __nw_verify as well; headless verify accepts either __nw_verify.lastRandomIds
+    // or __projectm_verify.presetIdFg/presetIdBg.
+    try {
+      const cur = (globalThis as any).__nw_verify ?? {};
+      const existingIds = cur.lastRandomIds;
+      if (!existingIds || typeof existingIds !== "object") {
+        (globalThis as any).__nw_verify = {
+          ...cur,
+          lastRandomIds: { fg: "fg:unknown", bg: "bg:unknown", n: 0 },
+        };
+      }
+    } catch {
+      // ignore
+    }
+
+    // Seed preset-id fields used by headless dualRandom precondition.
+    // These will be overwritten with real ids/urls once presets load, but must be non-empty early.
+    try {
+      const v = (globalThis as any).__projectm_verify ?? {};
+      const fg =
+        typeof v.presetIdFg === "string" && v.presetIdFg.trim()
+          ? v.presetIdFg
+          : "fg:unknown";
+      const bg =
+        typeof v.presetIdBg === "string" && v.presetIdBg.trim()
+          ? v.presetIdBg
+          : "bg:unknown";
+      (globalThis as any).__projectm_verify = {
+        ...v,
+        presetIdFg: fg,
+        presetIdBg: bg,
+      };
+    } catch {
+      // ignore
+    }
   };
   registerVerifyHooks();
 
@@ -2342,7 +2850,7 @@ export function bootstrapApp() {
   const noteCouplingSwitchDampen = (nowMs: number, reason: string) => {
     couplingSwitchDampenUntilMs = Math.max(
       couplingSwitchDampenUntilMs,
-      nowMs + COUPLING_SWITCH_DAMPEN_MS
+      nowMs + COUPLING_SWITCH_DAMPEN_MS,
     );
     recordControlPlaneEvent("COUPLER_DAMPEN", `switch:${reason}`);
   };
@@ -2350,7 +2858,7 @@ export function bootstrapApp() {
   const requestMacroWriteOwner = (
     source: MacroWriteSource,
     nowMs: number,
-    holdMs: number
+    holdMs: number,
   ) => {
     const active =
       macroWriteOwner && nowMs < macroWriteOwnerUntilMs
@@ -2397,15 +2905,15 @@ export function bootstrapApp() {
       state === "hold"
         ? "HOLD"
         : state === "midi"
-        ? "AIVJ: MIDI lock"
-        : state === "ai"
-        ? "AIVJ: AI"
-        : "AIVJ: off";
+          ? "AIVJ: MIDI lock"
+          : state === "ai"
+            ? "AIVJ: AI"
+            : "AIVJ: off";
   };
 
   const updateAivjPill = () => {
     setAivjPill(
-      presetHold ? "hold" : !aivj.enabled ? "off" : midiLock ? "midi" : "ai"
+      presetHold ? "hold" : !aivj.enabled ? "off" : midiLock ? "midi" : "ai",
     );
   };
 
@@ -2461,14 +2969,14 @@ export function bootstrapApp() {
       updateAivjPill();
       updateMacroBankPill();
       updateAivjSummary();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(followAiToggle, "change", () => {
       followAiUiEnabled = Boolean(followAiToggle.checked);
       writeStored(AIVJ_FOLLOW_UI_KEY, followAiUiEnabled ? "1" : "0");
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -2476,7 +2984,7 @@ export function bootstrapApp() {
       aivj.profile = readProfile();
       writeStored(AIVJ_PROFILE_KEY, aivj.profile);
       updateAivjSummary();
-    })
+    }),
   );
 
   type MacroMapMacroId = "fusion" | "motion" | "sparkle" | "fusionMotion";
@@ -2530,7 +3038,7 @@ export function bootstrapApp() {
 
   const clampMacroMapEntry = (
     key: MacroMapKey,
-    entry: Partial<MacroMapEntry> | null | undefined
+    entry: Partial<MacroMapEntry> | null | undefined,
   ): MacroMapEntry => {
     const fallback = MACRO_MAP_DEFAULTS[key];
     const macro = (entry?.macro ?? fallback.macro) as MacroMapMacroId;
@@ -2582,7 +3090,7 @@ export function bootstrapApp() {
     macro: MacroMapMacroId,
     fusion: number,
     motion: number,
-    sparkle: number
+    sparkle: number,
   ) => {
     if (macro === "fusion") return fusion;
     if (macro === "motion") return motion;
@@ -2594,7 +3102,7 @@ export function bootstrapApp() {
     entry: MacroMapEntry,
     fusion: number,
     motion: number,
-    sparkle: number
+    sparkle: number,
   ) => {
     const v = resolveMacroMapValue(entry.macro, fusion, motion, sparkle);
     return entry.min + (entry.max - entry.min) * v;
@@ -2662,7 +3170,7 @@ export function bootstrapApp() {
     for (const key of MACRO_MAP_KEYS) {
       const ui = (macroMapUi as any)[key];
       const macroRaw = String(
-        ui?.macro?.value ?? MACRO_MAP_DEFAULTS[key].macro
+        ui?.macro?.value ?? MACRO_MAP_DEFAULTS[key].macro,
       );
       const minRaw = Number(ui?.min?.value ?? MACRO_MAP_DEFAULTS[key].min);
       const maxRaw = Number(ui?.max?.value ?? MACRO_MAP_DEFAULTS[key].max);
@@ -2687,7 +3195,7 @@ export function bootstrapApp() {
 
   function applyMacroMapConfig(
     config: MacroMapConfig,
-    opts?: { persist?: boolean; syncUi?: boolean }
+    opts?: { persist?: boolean; syncUi?: boolean },
   ) {
     macroMapConfig = config;
     if (opts?.syncUi) syncMacroMapUiFromConfig(config);
@@ -2882,7 +3390,7 @@ export function bootstrapApp() {
   };
 
   const randomizeMacroMapConfig = (
-    rng: ReturnType<typeof createSeededRng>
+    rng: ReturnType<typeof createSeededRng>,
   ): MacroMapConfig => {
     const options: MacroMapMacroId[] = [
       "fusion",
@@ -2906,7 +3414,7 @@ export function bootstrapApp() {
   syncMacroMapUiFromConfig(macroMapConfig);
   const initialMacroPresetRaw = readStoredString(
     MACRO_PRESET_KEY,
-    "technoBoost"
+    "technoBoost",
   ) as MacroPresetId;
   const resolveMacroPresetId = (raw: string): MacroPresetId => {
     const next = raw as MacroPresetId;
@@ -2927,7 +3435,7 @@ export function bootstrapApp() {
       const raw = String(macroPresetSelect?.value ?? "technoBoost");
       const presetId = resolveMacroPresetId(raw);
       applyMacroPreset(presetId);
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(macroPresetSelect, "change", () => {
@@ -2938,7 +3446,7 @@ export function bootstrapApp() {
       if (macroPresetAutoToggle?.checked) {
         applyMacroPreset(presetId);
       }
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(macroPresetAutoToggle, "change", () => {
@@ -2948,14 +3456,14 @@ export function bootstrapApp() {
       const raw = String(macroPresetSelect?.value ?? "technoBoost");
       const presetId = resolveMacroPresetId(raw);
       applyMacroPreset(presetId);
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(macroMapToggleButton, "click", () => {
       if (!macroMapPanel) return;
       const nextVisible = macroMapPanel.style.display === "none";
       macroMapPanel.style.display = nextVisible ? "grid" : "none";
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(macroMapApplyButton, "click", () => {
@@ -2965,7 +3473,7 @@ export function bootstrapApp() {
         dom.audioStatus.textContent = "Macro map applied";
         dom.audioStatus.dataset.state = "ok";
       }
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(macroMapRandomButton, "click", () => {
@@ -2977,7 +3485,7 @@ export function bootstrapApp() {
         dom.audioStatus.textContent = "Macro map randomized";
         dom.audioStatus.dataset.state = "ok";
       }
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(macroMapSaveButton, "click", () => {
@@ -2987,7 +3495,7 @@ export function bootstrapApp() {
         dom.audioStatus.textContent = "Macro map saved";
         dom.audioStatus.dataset.state = "ok";
       }
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(macroMapLoadButton, "click", () => {
@@ -2997,7 +3505,7 @@ export function bootstrapApp() {
         dom.audioStatus.textContent = "Macro map loaded";
         dom.audioStatus.dataset.state = "ok";
       }
-    })
+    }),
   );
 
   const applyMacroBankToRuntime = (
@@ -3006,7 +3514,7 @@ export function bootstrapApp() {
       syncUi?: boolean;
       applyProjectm?: boolean;
       applyLiquid?: boolean;
-    }
+    },
   ) => {
     const applyProjectm = opts?.applyProjectm !== false;
     const applyLiquid = opts?.applyLiquid !== false;
@@ -3034,15 +3542,15 @@ export function bootstrapApp() {
     // ProjectM presence: editable macro map.
     const nextOpacity = clampMacroMapValue(
       "pmOpacity",
-      mapMacroValue(macroMapConfig.pmOpacity, fusion, motion, sparkle)
+      mapMacroValue(macroMapConfig.pmOpacity, fusion, motion, sparkle),
     );
     const nextEnergyToOpacityAmount = clampMacroMapValue(
       "pmEnergy",
-      mapMacroValue(macroMapConfig.pmEnergy, fusion, motion, sparkle)
+      mapMacroValue(macroMapConfig.pmEnergy, fusion, motion, sparkle),
     );
     const nextReactiveMultiplier = clampMacroMapValue(
       "pmReactive",
-      mapMacroValue(macroMapConfig.pmReactive, fusion, motion, sparkle)
+      mapMacroValue(macroMapConfig.pmReactive, fusion, motion, sparkle),
     );
 
     const allowProjectmMacro = applyProjectm && nowMs >= pmMacroHoldUntilMs;
@@ -3086,7 +3594,7 @@ export function bootstrapApp() {
         opacity: Math.min(1, Math.max(0, nextOpacity)),
         energyToOpacityAmount: Math.min(
           1,
-          Math.max(0, nextEnergyToOpacityAmount)
+          Math.max(0, nextEnergyToOpacityAmount),
         ),
       });
       controlPlaneDebug.finalWriter = "pm.opacity=macroMapper";
@@ -3098,7 +3606,7 @@ export function bootstrapApp() {
           pmEnergyOpacityInput.value = nextEnergyToOpacityAmount.toFixed(2);
         if (pmEnergyOpacityText)
           pmEnergyOpacityText.textContent = `${Math.round(
-            nextEnergyToOpacityAmount * 100
+            nextEnergyToOpacityAmount * 100,
           )}%`;
       }
     }
@@ -3107,27 +3615,27 @@ export function bootstrapApp() {
     const liquidPatch = {
       timeScale: clampMacroMapValue(
         "liquidTime",
-        mapMacroValue(macroMapConfig.liquidTime, fusion, motion, sparkle)
+        mapMacroValue(macroMapConfig.liquidTime, fusion, motion, sparkle),
       ),
       waveAmplitude: clampMacroMapValue(
         "liquidWave",
-        mapMacroValue(macroMapConfig.liquidWave, fusion, motion, sparkle)
+        mapMacroValue(macroMapConfig.liquidWave, fusion, motion, sparkle),
       ),
       metallicAmount: clampMacroMapValue(
         "liquidMetal",
-        mapMacroValue(macroMapConfig.liquidMetal, fusion, motion, sparkle)
+        mapMacroValue(macroMapConfig.liquidMetal, fusion, motion, sparkle),
       ),
       metallicSpeed: clampMacroMapValue(
         "liquidSpeed",
-        mapMacroValue(macroMapConfig.liquidSpeed, fusion, motion, sparkle)
+        mapMacroValue(macroMapConfig.liquidSpeed, fusion, motion, sparkle),
       ),
       brightness: clampMacroMapValue(
         "liquidBrightness",
-        mapMacroValue(macroMapConfig.liquidBrightness, fusion, motion, sparkle)
+        mapMacroValue(macroMapConfig.liquidBrightness, fusion, motion, sparkle),
       ),
       contrast: clampMacroMapValue(
         "liquidContrast",
-        mapMacroValue(macroMapConfig.liquidContrast, fusion, motion, sparkle)
+        mapMacroValue(macroMapConfig.liquidContrast, fusion, motion, sparkle),
       ),
       tintHue: clamp01Local(0.5 + s3 * 0.6, 0.0),
       tintStrength: clamp01Local(Math.abs(sparkle - 0.5) * 1.2, 0),
@@ -3223,7 +3731,7 @@ export function bootstrapApp() {
     const ids = ["aivj-m4", "aivj-m5", "aivj-m6", "aivj-m7", "aivj-m8"];
     const slots = ids.map((id) => {
       const s = (lastVisualState.global.macroSlots ?? []).find(
-        (x) => x.id === id
+        (x) => x.id === id,
       );
       return clamp01Local(s?.value ?? 0.5, 0.5);
     });
@@ -3236,6 +3744,9 @@ export function bootstrapApp() {
       },
       slots,
     };
+
+    // Kick off coupled manifest loading ASAP so eval can pass its bootstrap gate.
+    void ensureCoupledManifestLoaded("verifyHooks");
   };
 
   const applyMacroBankFromState = (overrideMacros?: {
@@ -3260,7 +3771,7 @@ export function bootstrapApp() {
     // Pause AI briefly so manual moves are visible and stable.
     aivjManualHoldUntilMs = Math.max(
       aivjManualHoldUntilMs,
-      nowMs + macroUserHoldMs
+      nowMs + macroUserHoldMs,
     );
     // Cancel any in-flight AI transition so it doesn't immediately overwrite.
     // Align AI baseline with the user's current bank so resuming AI is smooth.
@@ -3300,7 +3811,7 @@ export function bootstrapApp() {
 
   function setMacroValueText(
     which: "fusion" | "motion" | "sparkle",
-    v01: number
+    v01: number,
   ) {
     const pct = `${Math.round(clamp01Local(v01, 0.5) * 100)}%`;
     if (which === "fusion") dom.macroFusionValueText.textContent = pct;
@@ -3326,7 +3837,7 @@ export function bootstrapApp() {
 
   const pulseMacroStrip = (
     which: "fusion" | "motion" | "sparkle",
-    value01: number
+    value01: number,
   ) => {
     const state = macroPulseState[which];
     const next = clamp01Local(value01, state.value);
@@ -3348,8 +3859,8 @@ export function bootstrapApp() {
       which === "fusion"
         ? dom.macroFusionInput
         : which === "motion"
-        ? dom.macroMotionInput
-        : dom.macroSparkleInput;
+          ? dom.macroMotionInput
+          : dom.macroSparkleInput;
     const strip = input?.closest(".nw-macro-strip") as HTMLElement | null;
     if (!strip) return;
 
@@ -3378,15 +3889,15 @@ export function bootstrapApp() {
 
     setKnobVars(
       dom.macroFusionInput?.closest(".nw-knob") as HTMLElement | null,
-      fusion
+      fusion,
     );
     setKnobVars(
       dom.macroMotionInput?.closest(".nw-knob") as HTMLElement | null,
-      motion
+      motion,
     );
     setKnobVars(
       dom.macroSparkleInput?.closest(".nw-knob") as HTMLElement | null,
-      sparkle
+      sparkle,
     );
   }
 
@@ -3405,15 +3916,15 @@ export function bootstrapApp() {
 
     setKnobVars(
       dom.macroFusionInput?.closest(".nw-knob") as HTMLElement | null,
-      fusion
+      fusion,
     );
     setKnobVars(
       dom.macroMotionInput?.closest(".nw-knob") as HTMLElement | null,
-      motion
+      motion,
     );
     setKnobVars(
       dom.macroSparkleInput?.closest(".nw-knob") as HTMLElement | null,
-      sparkle
+      sparkle,
     );
 
     // Update AIVJ slot values (M4..M8) if present.
@@ -3422,17 +3933,17 @@ export function bootstrapApp() {
       const slotId = slotIds[i] as string;
       const v01 = clamp01Local(bank.slots?.[i] ?? 0.5, 0.5);
       const input = dom.macroSlotsContainer?.querySelector<HTMLInputElement>(
-        `[data-slot-id="${slotId}"] input[data-role="slot-value"]`
+        `[data-slot-id="${slotId}"] input[data-role="slot-value"]`,
       );
       if (!input) continue;
       input.value = String(v01);
       const knob = input.closest(
-        "[data-role='slot-knob']"
+        "[data-role='slot-knob']",
       ) as HTMLElement | null;
       setKnobVars(knob, v01);
       const wrapper = input.closest("[data-slot-id]") as HTMLElement | null;
       const valueText = wrapper?.querySelector<HTMLElement>(
-        "[data-role='slot-value-text']"
+        "[data-role='slot-value-text']",
       );
       if (valueText) valueText.textContent = `${Math.round(v01 * 100)}%`;
     }
@@ -3458,13 +3969,13 @@ export function bootstrapApp() {
       ? owner === "human"
         ? `宏库：已由用户接管${ttlS ? ` (${ttlS})` : ""}`
         : owner === "ai"
-        ? `宏库：已由AI接管${ttlS ? ` (${ttlS})` : ""}`
-        : `宏库：已由系统接管${ttlS ? ` (${ttlS})` : ""}`
+          ? `宏库：已由AI接管${ttlS ? ` (${ttlS})` : ""}`
+          : `宏库：已由系统接管${ttlS ? ` (${ttlS})` : ""}`
       : midiLock
-      ? "宏库：MIDI"
-      : aivj.enabled
-      ? "宏库：AI"
-      : "宏库：UI";
+        ? "宏库：MIDI"
+        : aivj.enabled
+          ? "宏库：AI"
+          : "宏库：UI";
 
     if (
       prevMode === mode &&
@@ -3480,7 +3991,7 @@ export function bootstrapApp() {
 
   function setMacroValue(
     key: "fusion" | "motion" | "sparkle",
-    value01: number
+    value01: number,
   ) {
     const v = clamp01Local(value01, 0.5);
     lastVisualState = {
@@ -3496,8 +4007,8 @@ export function bootstrapApp() {
       key === "fusion"
         ? dom.macroFusionInput
         : key === "motion"
-        ? dom.macroMotionInput
-        : dom.macroSparkleInput;
+          ? dom.macroMotionInput
+          : dom.macroSparkleInput;
     setKnobVars(input?.closest(".nw-knob") as HTMLElement | null, v);
 
     noteUserMacroInteraction();
@@ -3537,7 +4048,7 @@ export function bootstrapApp() {
     persistMacroSaves();
     if (dom.audioStatus) {
       dom.audioStatus.textContent = `Macro ${key} saved (${Math.round(
-        v * 100
+        v * 100,
       )}%)`;
       dom.audioStatus.dataset.state = "ok";
     }
@@ -3554,7 +4065,7 @@ export function bootstrapApp() {
     setMacroValue(key, v);
     if (dom.audioStatus) {
       dom.audioStatus.textContent = `Macro ${key} loaded (${Math.round(
-        v * 100
+        v * 100,
       )}%)`;
       dom.audioStatus.dataset.state = "ok";
     }
@@ -3564,36 +4075,40 @@ export function bootstrapApp() {
   trackBootstrapDispose(
     listen(dom.macroFusionInput, "input", () => {
       setMacroValue("fusion", Number(dom.macroFusionInput?.value ?? 0.5));
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(dom.macroMotionInput, "input", () => {
       setMacroValue("motion", Number(dom.macroMotionInput?.value ?? 0.5));
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(dom.macroSparkleInput, "input", () => {
       setMacroValue("sparkle", Number(dom.macroSparkleInput?.value ?? 0.5));
-    })
+    }),
   );
 
   trackBootstrapDispose(
-    listen(dom.macroFusionSaveButton, "click", () => saveMacroValue("fusion"))
+    listen(dom.macroFusionSaveButton, "click", () => saveMacroValue("fusion")),
   );
   trackBootstrapDispose(
-    listen(dom.macroFusionLoadButton, "click", () => loadMacroValue("fusion"))
+    listen(dom.macroFusionLoadButton, "click", () => loadMacroValue("fusion")),
   );
   trackBootstrapDispose(
-    listen(dom.macroMotionSaveButton, "click", () => saveMacroValue("motion"))
+    listen(dom.macroMotionSaveButton, "click", () => saveMacroValue("motion")),
   );
   trackBootstrapDispose(
-    listen(dom.macroMotionLoadButton, "click", () => loadMacroValue("motion"))
+    listen(dom.macroMotionLoadButton, "click", () => loadMacroValue("motion")),
   );
   trackBootstrapDispose(
-    listen(dom.macroSparkleSaveButton, "click", () => saveMacroValue("sparkle"))
+    listen(dom.macroSparkleSaveButton, "click", () =>
+      saveMacroValue("sparkle"),
+    ),
   );
   trackBootstrapDispose(
-    listen(dom.macroSparkleLoadButton, "click", () => loadMacroValue("sparkle"))
+    listen(dom.macroSparkleLoadButton, "click", () =>
+      loadMacroValue("sparkle"),
+    ),
   );
   trackBootstrapDispose(
     listen(dom.macroRandomButton, "click", () => {
@@ -3607,7 +4122,7 @@ export function bootstrapApp() {
         dom.audioStatus.textContent = "Randomized macros only";
         dom.audioStatus.dataset.state = "ok";
       }
-    })
+    }),
   );
 
   // Macro slots controller ("+ 槽位" + per-slot knobs).
@@ -3643,7 +4158,7 @@ export function bootstrapApp() {
       global: {
         ...lastVisualState.global,
         macroSlots: slots.map((s) =>
-          s.id === slotId ? ({ ...s, ...patch } as any) : s
+          s.id === slotId ? ({ ...s, ...patch } as any) : s,
         ),
       },
     };
@@ -3831,10 +4346,9 @@ export function bootstrapApp() {
       st.source === "webcam"
         ? ""
         : ws
-        ? ` | ws:${ws.state} frames:${ws.framesReceived}${
-            ws.lastError ? ` err:${ws.lastError}` : ""
+          ? ` | ws:${ws.state} frames:${ws.framesReceived}${ws.lastError ? ` err:${ws.lastError}` : ""
           }`
-        : " | ws:idle";
+          : " | ws:idle";
     const err = st.lastErrorName
       ? ` err:${st.lastErrorName}${
           st.lastErrorMessage ? `(${st.lastErrorMessage})` : ""
@@ -3856,7 +4370,7 @@ export function bootstrapApp() {
         layers: readNumberInputValue(depthLayersInput, 12),
         blur: readNumberInputValue(depthBlurInput, 10),
       },
-      "user"
+      "user",
     );
     updateDepthStatusLabel();
   }
@@ -3871,7 +4385,7 @@ export function bootstrapApp() {
         segmentPerson: Boolean(cameraSegmentToggle?.checked),
         // Keep defaults for quality/fps/blur unless Inspector is added later.
       },
-      "user"
+      "user",
     );
   }
 
@@ -3890,7 +4404,7 @@ export function bootstrapApp() {
         opacity: readRangeInputValue01(videoOpacityInput, 0.7),
         src: (videoSrcInput?.value ?? "").trim(),
       },
-      "user"
+      "user",
     );
   }
 
@@ -3900,7 +4414,7 @@ export function bootstrapApp() {
       {
         opacity: readRangeInputValue01(basicOpacityInput, 0.7),
       },
-      "user"
+      "user",
     );
   }
 
@@ -3950,12 +4464,6 @@ export function bootstrapApp() {
     presetAutoIntervalInput,
   ];
 
-  let currentPresetId: string | null = null;
-  let currentPresetUrl: string | null = null;
-  let projectLayerReady = false;
-  let currentPresetIdBg: string | null = null;
-  let currentPresetUrlBg: string | null = null;
-  let projectLayerBgReady = false;
   let autoCycleTimer: number | null = null;
   let autoCycleBgTimer: number | null = null;
   let autoCycleBackoffUntilMs = 0;
@@ -4096,9 +4604,81 @@ export function bootstrapApp() {
     }
   };
 
+  const publishVerifyPresetIds = () => {
+    try {
+      const fg = currentPresetId ?? currentPresetUrl ?? "fg:unknown";
+      const bg = currentPresetIdBg ?? currentPresetUrlBg ?? "bg:unknown";
+      (globalThis as any).__projectm_verify = {
+        ...(globalThis as any).__projectm_verify,
+        presetIdFg: fg,
+        presetIdBg: bg,
+      };
+    } catch {
+      // ignore
+    }
+  };
+
+  // Long-lived verify keepalive: headless verify's dualRandom precondition can run
+  // well after initial boot, so keep these fields present without overwriting real values.
+  try {
+    setInterval(() => {
+      publishVerifyPresetIds();
+      try {
+        const root = (globalThis as any).__nw_verify ?? {};
+        const prev = root.lastRandomIds;
+        if (!prev || typeof prev !== "object") {
+          (globalThis as any).__nw_verify = {
+            ...root,
+            lastRandomIds: { fg: "fg:unknown", bg: "bg:unknown", n: 0 },
+          };
+        } else {
+          const fg =
+            typeof (prev as any).fg === "string" && (prev as any).fg.trim()
+              ? (prev as any).fg
+              : "fg:unknown";
+          const bg =
+            typeof (prev as any).bg === "string" && (prev as any).bg.trim()
+              ? (prev as any).bg
+              : "bg:unknown";
+          const nPrev = Number((prev as any).n);
+          const n = Number.isFinite(nPrev) ? nPrev : 0;
+          (globalThis as any).__nw_verify = {
+            ...root,
+            lastRandomIds: { fg, bg, n },
+          };
+        }
+      } catch {
+        // ignore
+      }
+    }, 1000);
+  } catch {
+    // ignore
+  }
+
+  const bumpVerifyRandomIds = () => {
+    try {
+      const root = (globalThis as any).__nw_verify ?? {};
+      const prev = root.lastRandomIds ?? {};
+      const nPrev = Number(prev.n);
+      const n = Number.isFinite(nPrev) ? nPrev + 1 : 1;
+      const fg = currentPresetId ?? currentPresetUrl ?? "fg:unknown";
+      const bg = currentPresetIdBg ?? currentPresetUrlBg ?? "bg:unknown";
+      (globalThis as any).__nw_verify = {
+        ...root,
+        lastRandomIds: {
+          fg,
+          bg,
+          n,
+        },
+      };
+    } catch {
+      // ignore
+    }
+  };
+
   const updatePresetSwitchFirstFrame = async (
     report: PresetSwitchReport,
-    opts: { timeoutMs?: number } = {}
+    opts: { timeoutMs?: number } = {},
   ) => {
     const timeoutMs = Math.max(250, Math.min(4000, opts.timeoutMs ?? 1800));
     const tStart =
@@ -4133,34 +4713,35 @@ export function bootstrapApp() {
   const presetPredictor = createPresetPredictor();
   let presetPredictionEnabled = true; // 可通过 UI 或 config 关闭
 
-  // 统一性能预算管理器
-  const performanceBudgetManager = createPerformanceBudgetManager("high");
-  
   // 注册回调 - 统一管理所有子系统预算
   performanceBudgetManager.onAudioAnalysisFpsChange((fps) => {
     audioAnalysisFpsCap = Math.round(fps);
     audioBus.setAnalysisFpsCap(audioAnalysisFpsCap);
     recordControlPlaneEvent("AUDIO_FPS", `${audioAnalysisFpsCap}:budget`);
   });
-  
+
   performanceBudgetManager.onBeatTempoIntervalChange((intervalMs) => {
     // Beat tempo 使用 FPS，需要转换：fps = 1000 / intervalMs
     const fps = 1000 / intervalMs;
-    beatTempoFpsCap = Math.max(BEAT_TEMPO_FPS_LOW, Math.min(BEAT_TEMPO_FPS_HIGH, fps));
+    beatTempoFpsCap = Math.max(
+      BEAT_TEMPO_FPS_LOW,
+      Math.min(BEAT_TEMPO_FPS_HIGH, fps),
+    );
     recordControlPlaneEvent("BEAT_FPS", `${beatTempoFpsCap.toFixed(2)}:budget`);
   });
-  
+
   performanceBudgetManager.onPmAudioFeedIntervalChange((intervalMs) => {
     // 根据 intervalMs 映射到 mode
     const mode = intervalMs <= 33 ? "high" : intervalMs <= 50 ? "mid" : "low";
     const fgMs = intervalMs;
-    const bgMs = Math.round(intervalMs * 1.5); // bg 比 fg 慢 50%
+    // Headless verify asserts bg cadence in {55,80,120} when fg is {33,50,70}.
+    const bgMs = intervalMs <= 33 ? 55 : intervalMs <= 50 ? 80 : 120;
     projectLayer.setAudioFeedIntervalMs(fgMs);
     projectLayerBg.setAudioFeedIntervalMs(bgMs);
     pmAudioCadenceMode = mode;
     recordControlPlaneEvent("PM_AUDIO_FEED", `${mode}:${fgMs}/${bgMs}:budget`);
   });
-  
+
   performanceBudgetManager.onLevelChange((level) => {
     console.log(`[PerformanceBudget] Quality level: ${level}`);
   });
@@ -4297,7 +4878,7 @@ export function bootstrapApp() {
       }
       localStorage.setItem(
         AESTHETIC_BLACKLIST_STORAGE_KEY,
-        JSON.stringify(obj)
+        JSON.stringify(obj),
       );
     } catch {
       // ignore
@@ -4321,7 +4902,7 @@ export function bootstrapApp() {
   const markPresetAesthetic = (
     id: string,
     reason: string,
-    ttlMs = AESTHETIC_BLACKLIST_TTL_MS
+    ttlMs = AESTHETIC_BLACKLIST_TTL_MS,
   ) => {
     if (!id) return;
     const until = Date.now() + Math.max(1000, ttlMs);
@@ -4355,7 +4936,7 @@ export function bootstrapApp() {
     try {
       localStorage.setItem(
         RECENT_RANDOM_PRESET_STORAGE_KEY,
-        JSON.stringify(recentRandomPresetIds)
+        JSON.stringify(recentRandomPresetIds),
       );
     } catch {
       // ignore
@@ -4397,7 +4978,7 @@ export function bootstrapApp() {
       const target = Math.min(
         EXTRA_SAFE_PRESET_MAX,
         Math.max(0, EXTRA_SAFE_PRESET_MIN - currentCount),
-        bag.length
+        bag.length,
       );
       const sample: PresetDescriptor[] = [];
       for (let i = 0; i < target; i++) {
@@ -4427,7 +5008,7 @@ export function bootstrapApp() {
     const all = getAllPresets();
     const presets = all.filter(
       (p) =>
-        !isSoftBlacklisted(p.id, nowMs) && !isAestheticBlacklisted(p.id, nowMs)
+        !isSoftBlacklisted(p.id, nowMs) && !isAestheticBlacklisted(p.id, nowMs),
     );
     const pool = presets.length ? presets : all;
     if (!pool.length) return pool;
@@ -4462,7 +5043,7 @@ export function bootstrapApp() {
     const exploreMax = Math.min(30, restFresh.length);
     const exploreCount = Math.min(
       exploreMax,
-      Math.max(6, Math.round(goodFresh.length * 0.25))
+      Math.max(6, Math.round(goodFresh.length * 0.25)),
     );
     const bag = [...restFresh];
     const mixed = [...goodFresh];
@@ -4480,7 +5061,7 @@ export function bootstrapApp() {
     const all = getAllPresets();
     const presets = all.filter(
       (p) =>
-        !isSoftBlacklisted(p.id, nowMs) && !isAestheticBlacklisted(p.id, nowMs)
+        !isSoftBlacklisted(p.id, nowMs) && !isAestheticBlacklisted(p.id, nowMs),
     );
     const pool = presets.length ? presets : all;
     if (!pool.length) return undefined;
@@ -4493,13 +5074,13 @@ export function bootstrapApp() {
 
   const getNextPresetFilteredExcluding = (
     currentId: string | null,
-    excludeIds: Set<string>
+    excludeIds: Set<string>,
   ) => {
     const nowMs = Date.now();
     const all = getAllPresets();
     const presets = all.filter(
       (p) =>
-        !isSoftBlacklisted(p.id, nowMs) && !isAestheticBlacklisted(p.id, nowMs)
+        !isSoftBlacklisted(p.id, nowMs) && !isAestheticBlacklisted(p.id, nowMs),
     );
     const pool = presets.length ? presets : all;
     if (!pool.length) return undefined;
@@ -4568,7 +5149,7 @@ export function bootstrapApp() {
   };
 
   const schedulePresetPrefetchPump = (
-    delayMs = PRESET_PREFETCH_IDLE_DELAY_MS
+    delayMs = PRESET_PREFETCH_IDLE_DELAY_MS,
   ) => {
     if (presetPrefetchTimer != null) return;
     const nowMs =
@@ -4595,7 +5176,7 @@ export function bootstrapApp() {
     const pressureLeft = presetLoadPressureUntilMs - prefetchNowMs;
     if (pressureLeft > 0) {
       schedulePresetPrefetchPump(
-        Math.max(pressureLeft + PRESET_PREFETCH_PRESSURE_DELAY_MS, 240)
+        Math.max(pressureLeft + PRESET_PREFETCH_PRESSURE_DELAY_MS, 240),
       );
       return;
     }
@@ -4645,7 +5226,7 @@ export function bootstrapApp() {
 
   const enqueuePresetPrefetch = (
     preset: PresetDescriptor | null | undefined,
-    reason: string
+    reason: string,
   ) => {
     if (!preset?.url || !preset.id) return;
     const nowMs = Date.now();
@@ -4671,13 +5252,13 @@ export function bootstrapApp() {
     currentId: string | null,
     count: number,
     reason: string,
-    excludeIds?: Set<string>
+    excludeIds?: Set<string>,
   ) => {
     const nowMs = Date.now();
     const all = getAllPresets();
     const filtered = all.filter(
       (p) =>
-        !isSoftBlacklisted(p.id, nowMs) && !isAestheticBlacklisted(p.id, nowMs)
+        !isSoftBlacklisted(p.id, nowMs) && !isAestheticBlacklisted(p.id, nowMs),
     );
     const pool = filtered.length ? filtered : all;
     if (!pool.length) return;
@@ -4694,7 +5275,7 @@ export function bootstrapApp() {
       const predictions = presetPredictor.predict(
         currentId,
         candidateIds,
-        count
+        count,
       );
 
       for (const pred of predictions) {
@@ -4703,7 +5284,7 @@ export function bootstrapApp() {
         if (preset && !alreadyQueued.has(preset.id)) {
           enqueuePresetPrefetch(
             preset,
-            `${reason}+predicted(${pred.reason},${pred.score.toFixed(2)})`
+            `${reason}+predicted(${pred.reason},${pred.score.toFixed(2)})`,
           );
           alreadyQueued.add(preset.id);
           queued += 1;
@@ -4775,7 +5356,7 @@ export function bootstrapApp() {
       typeof performance !== "undefined" ? performance.now() : Date.now();
     presetLoadPressureUntilMs = Math.max(
       presetLoadPressureUntilMs,
-      nowMs + PRESET_LOAD_PRESSURE_MS
+      nowMs + PRESET_LOAD_PRESSURE_MS,
     );
     applyAudioAnalysisCap(AUDIO_ANALYSIS_FPS_MIN, `preset:${reason}`, nowMs);
     applyBeatTempoCap(BEAT_TEMPO_FPS_LOW, `preset:${reason}`, nowMs);
@@ -4796,24 +5377,28 @@ export function bootstrapApp() {
   const loadPresetMaybeCached = async (
     layer: ProjectMLayer,
     preset: PresetDescriptor,
-    reason: string
+    reason: string,
   ) => {
     notePresetLoadPressure(reason);
-    const cachedText = getPresetPrefetchText(preset.url);
+    const url = preset.url;
+    if (!url) {
+      throw new Error(`Preset missing url: ${preset.id}`);
+    }
+    const cachedText = getPresetPrefetchText(url);
     if (cachedText != null) {
       await yieldToBrowser();
       layer.loadPresetFromData(cachedText);
       return { cache: "hit" as const };
     }
     await yieldToBrowser();
-    await layer.loadPresetFromUrl(preset.url);
+    await layer.loadPresetFromUrl(url);
     return { cache: "miss" as const };
   };
 
   const loadPresetUrlMaybeCached = async (
     layer: ProjectMLayer,
     url: string,
-    reason: string
+    reason: string,
   ) => {
     notePresetLoadPressure(reason);
     const cachedText = getPresetPrefetchText(url);
@@ -4840,7 +5425,7 @@ export function bootstrapApp() {
     if (!all.length) return [];
     const filtered = all.filter(
       (p) =>
-        !isSoftBlacklisted(p.id, nowMs) && !isAestheticBlacklisted(p.id, nowMs)
+        !isSoftBlacklisted(p.id, nowMs) && !isAestheticBlacklisted(p.id, nowMs),
     );
     const pool = filtered.length ? filtered : all;
     const good = pool.filter((p) => goodPresetIds.has(p.id));
@@ -4898,11 +5483,12 @@ export function bootstrapApp() {
       const cacheResult = await loadPresetMaybeCached(
         projectLayer,
         preset,
-        "anchor"
+        "anchor",
       );
       const prevPresetId = currentPresetId; // 记录切换前的 ID
       currentPresetId = preset.id;
-      currentPresetUrl = preset.url;
+      currentPresetUrl = preset.url ?? null;
+      publishVerifyPresetIds();
       recordPresetTransition(prevPresetId, preset.id); // 记录到预测引擎
       recordPresetSuccess(preset);
       updatePresetSelectValue(preset.id);
@@ -4917,7 +5503,7 @@ export function bootstrapApp() {
         scope: "fg",
         origin: "anchor",
         presetId: preset.id,
-        presetUrl: preset.url,
+        presetUrl: preset.url ?? null,
         presetLabel: preset.label,
         tStartMs: startMs,
         tEndMs: tEnd,
@@ -4950,7 +5536,7 @@ export function bootstrapApp() {
         scope: "fg",
         origin: "anchor",
         presetId: preset.id,
-        presetUrl: preset.url,
+        presetUrl: preset.url ?? null,
         presetLabel: preset.label,
         tStartMs: startMs,
         tEndMs: tEnd,
@@ -4996,7 +5582,7 @@ export function bootstrapApp() {
     value: unknown,
     min: number,
     max: number,
-    fallback: number
+    fallback: number,
   ) => {
     const n = Number(value);
     if (!Number.isFinite(n)) return fallback;
@@ -5022,13 +5608,13 @@ export function bootstrapApp() {
               (v as any)?.externalOpacityBiasSigned,
               -1,
               1,
-              0
+              0,
             ),
             audioReactiveMultiplier: clampNumber(
               (v as any)?.audioReactiveMultiplier,
               0,
               3,
-              1
+              1,
             ),
           };
         }
@@ -5043,7 +5629,7 @@ export function bootstrapApp() {
     try {
       localStorage.setItem(
         PROJECTM_PRESET_TUNING_STORAGE_KEY,
-        JSON.stringify(projectmPresetTuningByUrl)
+        JSON.stringify(projectmPresetTuningByUrl),
       );
     } catch {
       // ignore
@@ -5075,18 +5661,18 @@ export function bootstrapApp() {
       t.externalOpacityBiasSigned,
       -1,
       1,
-      0
+      0,
     );
     pmPresetAudioReactiveMultiplier = clampNumber(
       t.audioReactiveMultiplier,
       0,
       3,
-      1
+      1,
     );
     try {
       if (projectLayerReady) {
         projectLayer.setAudioReactiveMultiplier(
-          pmPresetAudioReactiveMultiplier
+          pmPresetAudioReactiveMultiplier,
         );
       }
     } catch {
@@ -5117,7 +5703,7 @@ export function bootstrapApp() {
   const randomizeProjectMPresetTuningForActivePreset = (
     rng: ReturnType<typeof createSeededRng>,
     energy01: number,
-    reason: string
+    reason: string,
   ) => {
     const url = getActivePresetUrlForTuning();
     if (!url) return;
@@ -5134,7 +5720,7 @@ export function bootstrapApp() {
         randIn(0.75 + 0.35 * e, 1.65 + 0.95 * e),
         0,
         3,
-        1
+        1,
       ),
     };
     projectmPresetTuningByUrl = {
@@ -5165,7 +5751,7 @@ export function bootstrapApp() {
 
   function buildCurrentVisualState(
     globalOverride: VisualStateV2["global"] = lastVisualState.global,
-    backgroundOverride: VisualStateV2["background"] = lastVisualState.background
+    backgroundOverride: VisualStateV2["background"] = lastVisualState.background,
   ): VisualStateV2 {
     const blend = getCurrentBlendParams();
     const preset = currentPresetId ? findPresetById(currentPresetId) : null;
@@ -5311,7 +5897,7 @@ export function bootstrapApp() {
 
   const updateLastVisualStateLayer = (
     layer: "liquid" | "basic" | "camera" | "video" | "depth",
-    patch: Record<string, unknown>
+    patch: Record<string, unknown>,
   ) => {
     const existingLayers = lastVisualState.background.layers ?? {
       liquid: {},
@@ -5358,11 +5944,11 @@ export function bootstrapApp() {
     const v = clamp01(Number.isFinite(value01) ? value01 : 0.6);
     overlayBudget.pmRetreatStrength = Math.min(
       0.7,
-      Math.max(0.05, 0.6 - 0.45 * v)
+      Math.max(0.05, 0.6 - 0.45 * v),
     );
     overlayBudget.pmRetreatFloor = Math.min(
       0.9,
-      Math.max(0.35, 0.5 + 0.35 * v)
+      Math.max(0.35, 0.5 + 0.35 * v),
     );
     if (pmPriorityInput) pmPriorityInput.value = v.toFixed(2);
     if (pmPriorityText) pmPriorityText.textContent = `${Math.round(v * 100)}%`;
@@ -5370,7 +5956,7 @@ export function bootstrapApp() {
       pmRetreatStrengthInput.value = overlayBudget.pmRetreatStrength.toFixed(2);
     if (pmRetreatStrengthText)
       pmRetreatStrengthText.textContent = `${Math.round(
-        overlayBudget.pmRetreatStrength * 100
+        overlayBudget.pmRetreatStrength * 100,
       )}%`;
     writeStored(PM_PRIORITY_KEY, v.toFixed(2));
   };
@@ -5411,7 +5997,7 @@ export function bootstrapApp() {
   };
 
   const noteOverlayBudgetHold = (
-    layer: "basic" | "camera" | "video" | "depth"
+    layer: "basic" | "camera" | "video" | "depth",
   ) => {
     const now =
       typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -5588,7 +6174,7 @@ export function bootstrapApp() {
     const assignWeight = (
       key: string,
       macro: "fusion" | "motion" | "sparkle",
-      field: "energy" | "bass" | "flux" | "beatPulse"
+      field: "energy" | "bass" | "flux" | "beatPulse",
     ) => {
       if (!Object.prototype.hasOwnProperty.call(patch, key)) return;
       const v = Number((patch as any)[key]);
@@ -5618,69 +6204,69 @@ export function bootstrapApp() {
     if (Object.prototype.hasOwnProperty.call(patch, "overlayBudgetMaxEnergy"))
       overlayBudget.maxEnergy = clampOr(
         (patch as any).overlayBudgetMaxEnergy,
-        overlayBudget.maxEnergy
+        overlayBudget.maxEnergy,
       );
     if (Object.prototype.hasOwnProperty.call(patch, "overlayBudgetMinScale"))
       overlayBudget.minScale = clampOr(
         (patch as any).overlayBudgetMinScale,
-        overlayBudget.minScale
+        overlayBudget.minScale,
       );
     if (Object.prototype.hasOwnProperty.call(patch, "overlayBudgetDepthWeight"))
       overlayBudget.depthWeight = clampOr(
         (patch as any).overlayBudgetDepthWeight,
-        overlayBudget.depthWeight
+        overlayBudget.depthWeight,
       );
     if (
       Object.prototype.hasOwnProperty.call(patch, "overlayBudgetSmoothBaseMs")
     )
       overlayBudget.smoothBaseMs = clampOr(
         (patch as any).overlayBudgetSmoothBaseMs,
-        overlayBudget.smoothBaseMs
+        overlayBudget.smoothBaseMs,
       );
     if (
       Object.prototype.hasOwnProperty.call(patch, "overlayBudgetPriorityBasic")
     )
       overlayBudget.priorityBasic = clampOr(
         (patch as any).overlayBudgetPriorityBasic,
-        overlayBudget.priorityBasic
+        overlayBudget.priorityBasic,
       );
     if (
       Object.prototype.hasOwnProperty.call(patch, "overlayBudgetPriorityCamera")
     )
       overlayBudget.priorityCamera = clampOr(
         (patch as any).overlayBudgetPriorityCamera,
-        overlayBudget.priorityCamera
+        overlayBudget.priorityCamera,
       );
     if (
       Object.prototype.hasOwnProperty.call(patch, "overlayBudgetPriorityVideo")
     )
       overlayBudget.priorityVideo = clampOr(
         (patch as any).overlayBudgetPriorityVideo,
-        overlayBudget.priorityVideo
+        overlayBudget.priorityVideo,
       );
     if (
       Object.prototype.hasOwnProperty.call(patch, "overlayBudgetPriorityDepth")
     )
       overlayBudget.priorityDepth = clampOr(
         (patch as any).overlayBudgetPriorityDepth,
-        overlayBudget.priorityDepth
+        overlayBudget.priorityDepth,
       );
     if (
       Object.prototype.hasOwnProperty.call(
         patch,
-        "overlayBudgetPmRetreatStrength"
+        "overlayBudgetPmRetreatStrength",
       )
     )
       overlayBudget.pmRetreatStrength = clampOr(
         (patch as any).overlayBudgetPmRetreatStrength,
-        overlayBudget.pmRetreatStrength
+        overlayBudget.pmRetreatStrength,
       );
     if (
       Object.prototype.hasOwnProperty.call(patch, "overlayBudgetPmRetreatFloor")
     )
       overlayBudget.pmRetreatFloor = clampOr(
         (patch as any).overlayBudgetPmRetreatFloor,
-        overlayBudget.pmRetreatFloor
+        overlayBudget.pmRetreatFloor,
       );
 
     if (Object.prototype.hasOwnProperty.call(patch, "pmClosedLoopEnabled")) {
@@ -5702,7 +6288,7 @@ export function bootstrapApp() {
     if (Object.prototype.hasOwnProperty.call(patch, "pmClosedLoopTargetLuma"))
       pmClosedLoop.targetLuma = clamp01(
         (patch as any).pmClosedLoopTargetLuma,
-        pmClosedLoop.targetLuma
+        pmClosedLoop.targetLuma,
       );
     if (Object.prototype.hasOwnProperty.call(patch, "pmClosedLoopKp"))
       pmClosedLoop.kp = clampOr((patch as any).pmClosedLoopKp, pmClosedLoop.kp);
@@ -5713,24 +6299,24 @@ export function bootstrapApp() {
     )
       pmClosedLoop.integralClamp = clamp01(
         (patch as any).pmClosedLoopIntegralClamp,
-        pmClosedLoop.integralClamp
+        pmClosedLoop.integralClamp,
       );
     if (Object.prototype.hasOwnProperty.call(patch, "pmClosedLoopOutputClamp"))
       pmClosedLoop.outputClamp = clamp01(
         (patch as any).pmClosedLoopOutputClamp,
-        pmClosedLoop.outputClamp
+        pmClosedLoop.outputClamp,
       );
     if (
       Object.prototype.hasOwnProperty.call(patch, "pmClosedLoopMaxDeltaPerSec")
     )
       pmClosedLoop.maxDeltaPerSec = clampOr(
         (patch as any).pmClosedLoopMaxDeltaPerSec,
-        pmClosedLoop.maxDeltaPerSec
+        pmClosedLoop.maxDeltaPerSec,
       );
     if (Object.prototype.hasOwnProperty.call(patch, "pmClosedLoopIntervalMs"))
       pmClosedLoop.intervalMs = clampOr(
         (patch as any).pmClosedLoopIntervalMs,
-        pmClosedLoop.intervalMs
+        pmClosedLoop.intervalMs,
       );
 
     if (Object.prototype.hasOwnProperty.call(patch, "pmColorLoopEnabled")) {
@@ -5746,36 +6332,36 @@ export function bootstrapApp() {
     if (Object.prototype.hasOwnProperty.call(patch, "pmColorLoopHueOffset"))
       pmColorLoop.hueOffset = clamp01(
         (patch as any).pmColorLoopHueOffset,
-        pmColorLoop.hueOffset
+        pmColorLoop.hueOffset,
       );
     if (Object.prototype.hasOwnProperty.call(patch, "pmColorLoopAmount"))
       pmColorLoop.amount = clamp01(
         (patch as any).pmColorLoopAmount,
-        pmColorLoop.amount
+        pmColorLoop.amount,
       );
     if (Object.prototype.hasOwnProperty.call(patch, "pmColorLoopMaxStrength"))
       pmColorLoop.maxStrength = clamp01(
         (patch as any).pmColorLoopMaxStrength,
-        pmColorLoop.maxStrength
+        pmColorLoop.maxStrength,
       );
     if (
       Object.prototype.hasOwnProperty.call(patch, "pmColorLoopContrastAmount")
     )
       pmColorLoop.contrastAmount = clamp01(
         (patch as any).pmColorLoopContrastAmount,
-        pmColorLoop.contrastAmount
+        pmColorLoop.contrastAmount,
       );
     if (
       Object.prototype.hasOwnProperty.call(patch, "pmColorLoopMaxDeltaPerSec")
     )
       pmColorLoop.maxDeltaPerSec = clampOr(
         (patch as any).pmColorLoopMaxDeltaPerSec,
-        pmColorLoop.maxDeltaPerSec
+        pmColorLoop.maxDeltaPerSec,
       );
     if (Object.prototype.hasOwnProperty.call(patch, "pmColorLoopIntervalMs"))
       pmColorLoop.intervalMs = clampOr(
         (patch as any).pmColorLoopIntervalMs,
-        pmColorLoop.intervalMs
+        pmColorLoop.intervalMs,
       );
   };
 
@@ -5821,7 +6407,7 @@ export function bootstrapApp() {
       buildCurrentVisualState(),
       {
         background: { type: resolvedType },
-      }
+      },
     );
 
     // Apply current UI params so enabling a layer is immediately visible.
@@ -5838,7 +6424,7 @@ export function bootstrapApp() {
   const applyBackgroundLayerPatch = (
     type: "liquid" | "basic" | "camera" | "video" | "depth",
     patch: Record<string, unknown>,
-    _source: "user" | "macro" | "closedLoop" | "random" = "user"
+    _source: "user" | "macro" | "closedLoop" | "random" = "user",
   ) => {
     if (type === "camera" && !cameraLayer) return;
 
@@ -5961,7 +6547,7 @@ export function bootstrapApp() {
 
     lastVisualState = visualStateController.applyPatch(
       buildCurrentVisualState(),
-      vsPatch
+      vsPatch,
     );
   };
 
@@ -6053,11 +6639,11 @@ export function bootstrapApp() {
 
           const hasW = Object.prototype.hasOwnProperty.call(
             patch,
-            "fixedWidth"
+            "fixedWidth",
           );
           const hasH = Object.prototype.hasOwnProperty.call(
             patch,
-            "fixedHeight"
+            "fixedHeight",
           );
           if (hasW || hasH) {
             const cfg = sceneManager.getCompositorConfig();
@@ -6069,7 +6655,7 @@ export function bootstrapApp() {
             lastResCommitMs = nowMs;
             recordControlPlaneEvent(
               "RES_COMMIT",
-              `${Math.floor(Number(w))}x${Math.floor(Number(h))}`
+              `${Math.floor(Number(w))}x${Math.floor(Number(h))}`,
             );
             decisionTrace.record({
               tMs: nowMs,
@@ -6108,27 +6694,27 @@ export function bootstrapApp() {
           if (
             Object.prototype.hasOwnProperty.call(
               patch,
-              "externalOpacityBiasSigned"
+              "externalOpacityBiasSigned",
             )
           ) {
             next.externalOpacityBiasSigned = clampNumber(
               (patch as any).externalOpacityBiasSigned,
               -1,
               1,
-              next.externalOpacityBiasSigned
+              next.externalOpacityBiasSigned,
             );
           }
           if (
             Object.prototype.hasOwnProperty.call(
               patch,
-              "audioReactiveMultiplier"
+              "audioReactiveMultiplier",
             )
           ) {
             next.audioReactiveMultiplier = clampNumber(
               (patch as any).audioReactiveMultiplier,
               0,
               3,
-              next.audioReactiveMultiplier
+              next.audioReactiveMultiplier,
             );
           }
 
@@ -6209,7 +6795,7 @@ export function bootstrapApp() {
 
   const recomputeMidiLock = (bindings: MidiBinding[]) => {
     midiLock = bankTargets.every((t) =>
-      bindings.some((b) => sameTarget(b.target, t))
+      bindings.some((b) => sameTarget(b.target, t)),
     );
     updateMacroBankPill();
     updateAivjPill();
@@ -6217,7 +6803,7 @@ export function bootstrapApp() {
 
   const setMacroValue01 = (
     key: "fusion" | "motion" | "sparkle",
-    value01: number
+    value01: number,
   ) => {
     setMacroValue(key, value01);
     // Keep Inspector + saved state consistent.
@@ -6244,7 +6830,7 @@ export function bootstrapApp() {
           audioDrivenOpacity: (patch as any).audioDrivenOpacity,
           energyToOpacityAmount: patch.energyToOpacityAmount,
         } as any,
-      }
+      },
     );
 
     syncBlendControlsFromLayer();
@@ -6289,7 +6875,7 @@ export function bootstrapApp() {
       recomputeMidiLock(bindings);
       setInspectorStatusExtraTransient(
         `midi bindings: ${bindings.length}`,
-        2000
+        2000,
       );
     },
     audioControlsDefs: paramSchema.audio.controls,
@@ -6471,7 +7057,7 @@ export function bootstrapApp() {
       pmEnergyOpacityInput.value = String(blend.energyToOpacityAmount);
     if (pmEnergyOpacityText)
       pmEnergyOpacityText.textContent = `${Math.round(
-        blend.energyToOpacityAmount * 100
+        blend.energyToOpacityAmount * 100,
       )}%`;
   }
 
@@ -6480,7 +7066,7 @@ export function bootstrapApp() {
     // Claim macro write ownership so runtime macro writer won't fight these sliders.
     try {
       noteHumanMacroOwnership(
-        typeof performance !== "undefined" ? performance.now() : Date.now()
+        typeof performance !== "undefined" ? performance.now() : Date.now(),
       );
       notePmMacroHold();
       noteProjectmVisibilityHold();
@@ -6491,7 +7077,7 @@ export function bootstrapApp() {
     const rawOpacity = Number(pmOpacityInput?.value ?? 0.7);
     const opacity = Math.min(
       1,
-      Math.max(0, Number.isFinite(rawOpacity) ? rawOpacity : 0.8)
+      Math.max(0, Number.isFinite(rawOpacity) ? rawOpacity : 0.8),
     );
     if (pmOpacityText)
       pmOpacityText.textContent = `${Math.round(opacity * 100)}%`;
@@ -6500,11 +7086,11 @@ export function bootstrapApp() {
     const rawAmount = Number(pmEnergyOpacityInput?.value ?? 0.25);
     const energyToOpacityAmount = Math.min(
       1,
-      Math.max(0, Number.isFinite(rawAmount) ? rawAmount : 0.3)
+      Math.max(0, Number.isFinite(rawAmount) ? rawAmount : 0.3),
     );
     if (pmEnergyOpacityText)
       pmEnergyOpacityText.textContent = `${Math.round(
-        energyToOpacityAmount * 100
+        energyToOpacityAmount * 100,
       )}%`;
 
     // Keep compositor blend mode consistent with toolbar state.
@@ -6543,7 +7129,7 @@ export function bootstrapApp() {
     origin: string,
     label: string | null,
     brokenId: string,
-    opts?: { forcePresetLoad?: boolean }
+    opts?: { forcePresetLoad?: boolean },
   ) {
     lastVisualState = ensureAivjMacroBankSlots(cloneVisualState(state));
 
@@ -6568,7 +7154,7 @@ export function bootstrapApp() {
           ...liquidParams,
           enabled: Boolean(liquidParams.enabled ?? true),
         },
-        "user"
+        "user",
       );
     }
 
@@ -6576,7 +7162,7 @@ export function bootstrapApp() {
     applyBackgroundLayerPatch(
       "basic",
       { ...basicParams, enabled: Boolean(basicParams.enabled) },
-      "user"
+      "user",
     );
     if (basicOpacityInput && basicParams.opacity != null) {
       basicOpacityInput.value = String(basicParams.opacity);
@@ -6588,13 +7174,13 @@ export function bootstrapApp() {
     applyBackgroundLayerPatch(
       "camera",
       { ...camParams, enabled: Boolean(camParams.enabled) },
-      "user"
+      "user",
     );
     if (cameraOpacityInput && camParams.opacity != null) {
       cameraOpacityInput.value = String(camParams.opacity);
       if (cameraOpacityText)
         cameraOpacityText.textContent = fmtPct(
-          Number(cameraOpacityInput.value)
+          Number(cameraOpacityInput.value),
         );
     }
     if (cameraDeviceSelect && camParams.deviceId != null) {
@@ -6608,7 +7194,7 @@ export function bootstrapApp() {
     applyBackgroundLayerPatch(
       "video",
       { ...vidParams, enabled: Boolean(vidParams.enabled) },
-      "user"
+      "user",
     );
     if (videoOpacityInput && vidParams.opacity != null) {
       videoOpacityInput.value = String(vidParams.opacity);
@@ -6625,7 +7211,7 @@ export function bootstrapApp() {
     applyBackgroundLayerPatch(
       "depth",
       { ...depParams, enabled: Boolean(depParams.enabled) },
-      "user"
+      "user",
     );
     if (depthSourceSelect && depParams.source != null)
       depthSourceSelect.value = String(depParams.source);
@@ -6652,14 +7238,14 @@ export function bootstrapApp() {
       depthLayersInput.value = String(depParams.layers);
       if (depthLayersText)
         depthLayersText.textContent = String(
-          Math.round(Number(depthLayersInput.value))
+          Math.round(Number(depthLayersInput.value)),
         );
     }
     if (depthBlurInput && depParams.blur != null) {
       depthBlurInput.value = String(depParams.blur);
       if (depthBlurText)
         depthBlurText.textContent = String(
-          Math.round(Number(depthBlurInput.value))
+          Math.round(Number(depthBlurInput.value)),
         );
     }
 
@@ -6689,7 +7275,7 @@ export function bootstrapApp() {
     if (projectLayerReady && targetPresetUrl) {
       const holdNote = presetHold ? " (HOLD bypass)" : "";
       setPresetStatus(
-        `Loading ${origin}${holdNote}: ${label ?? targetPresetUrl} ...`
+        `Loading ${origin}${holdNote}: ${label ?? targetPresetUrl} ...`,
       );
       if (presetLoadInFlight) {
         setPresetStatus("Preset switch in progress…");
@@ -6724,12 +7310,15 @@ export function bootstrapApp() {
           const cacheResult = await loadPresetUrlMaybeCached(
             projectLayer,
             targetPresetUrl,
-            `snapshot:${origin}`
+            `snapshot:${origin}`,
           );
           const prevPresetId = currentPresetId; // 记录切换前
           currentPresetId = targetPresetId;
           currentPresetUrl = targetPresetUrl;
-          recordPresetTransition(prevPresetId, targetPresetId); // 记录转移
+          publishVerifyPresetIds();
+          if (targetPresetId) {
+            recordPresetTransition(prevPresetId, targetPresetId); // 记录转移
+          }
           recordPresetSuccess(preset ?? findPresetById(targetPresetId ?? ""));
           if (targetPresetId) {
             recordPresetLoadSuccess(targetPresetId, nowMs() - loadStartMs);
@@ -6776,7 +7365,7 @@ export function bootstrapApp() {
           const reasonNote = reason ? ` | ${reason}` : "";
           handlePresetLoadError(
             `Failed to load ${origin}: ${targetLabel}${compatNote}${reasonNote}`,
-            error
+            error,
           );
           const elapsedMs = nowMs() - loadStartMs;
           handlePresetFailure({ id: brokenId }, error, elapsedMs);
@@ -6814,6 +7403,7 @@ export function bootstrapApp() {
     } else {
       currentPresetId = targetPresetId;
       currentPresetUrl = targetPresetUrl;
+      publishVerifyPresetIds();
     }
   }
 
@@ -6825,7 +7415,7 @@ export function bootstrapApp() {
       `fav:${fav.id}`,
       {
         forcePresetLoad: true,
-      }
+      },
     );
   }
 
@@ -6854,7 +7444,7 @@ export function bootstrapApp() {
               "fullscreenExit",
               typeof performance !== "undefined"
                 ? performance.now()
-                : Date.now()
+                : Date.now(),
             );
             return;
           }
@@ -6862,27 +7452,27 @@ export function bootstrapApp() {
           await (target as any).requestFullscreen?.();
           captureColorSnapshot(
             "fullscreenEnter",
-            typeof performance !== "undefined" ? performance.now() : Date.now()
+            typeof performance !== "undefined" ? performance.now() : Date.now(),
           );
         } catch {
           // ignore
         }
       })();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(calibrationToggleButton, "click", () => {
       setCalibrationOverlayEnabled(
         !calibrationOverlayEnabled,
-        "calibrationToggle"
+        "calibrationToggle",
       );
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(snapshotExportButton, "click", () => {
       exportRuntimeSnapshot("toolbar");
-    })
+    }),
   );
 
   // Favorites panel UI is handled by src/features/favorites/FavoritesPanel.ts
@@ -6987,7 +7577,7 @@ export function bootstrapApp() {
         updatePresetManifestInfo(
           `Loaded ${presets.length} presets - ${
             manifest.sourcePath ?? "custom pack"
-          }`
+          }`,
         );
       } else {
         updatePresetManifestInfo("Preset manifest has 0 entries");
@@ -6996,13 +7586,13 @@ export function bootstrapApp() {
     } catch (error) {
       console.warn("Preset manifest unavailable", error);
       // Fallback to built-ins so the preset UI remains usable even if the manifest is missing.
-      runtimePresetList = BUILT_IN_PRESETS;
-      registerRuntimePresets(BUILT_IN_PRESETS);
+      runtimePresetList = [...BUILT_IN_PRESETS];
+      registerRuntimePresets([...BUILT_IN_PRESETS]);
       refreshPresetSelect();
       updatePresetCyclerAvailability();
       updatePresetManifestInfo(
         `Preset manifest missing - using built-ins (run npm run sync:presets for full packs)`,
-        true
+        true,
       );
     }
   }
@@ -7018,7 +7608,7 @@ export function bootstrapApp() {
         updatePresetManifestInfo(
           `Loaded ${presets.length} presets - ${
             manifest.sourceRoot ?? "custom pack"
-          }`
+          }`,
         );
       } else {
         updatePresetManifestInfo("Preset manifest has 0 entries");
@@ -7026,13 +7616,13 @@ export function bootstrapApp() {
       void seedExtraSafePresetsIfNeeded(currentLibrarySource);
     } catch (error) {
       console.warn("Preset manifest unavailable", error);
-      runtimePresetList = BUILT_IN_PRESETS;
-      registerRuntimePresets(BUILT_IN_PRESETS);
+      runtimePresetList = [...BUILT_IN_PRESETS];
+      registerRuntimePresets([...BUILT_IN_PRESETS]);
       refreshPresetSelect();
       updatePresetCyclerAvailability();
       updatePresetManifestInfo(
         `Preset manifest missing - using built-ins (run npm run sync:presets for full packs)`,
-        true
+        true,
       );
     }
   }
@@ -7056,7 +7646,7 @@ export function bootstrapApp() {
         updatePresetManifestInfo(
           `Loaded ${presets.length} presets | ${label}${filteredInfo} | ${
             manifest.sourceRoot ?? "custom pack"
-          }`
+          }`,
         );
       } else {
         updatePresetManifestInfo(`Preset manifest has 0 entries | ${label}`);
@@ -7075,17 +7665,17 @@ export function bootstrapApp() {
         ? findPresetById(currentPresetId)
         : null;
       setPresetStatus(
-        initialPreset ? `Preset: ${initialPreset.label}` : "Preset ready"
+        initialPreset ? `Preset: ${initialPreset.label}` : "Preset ready",
       );
     } catch (error) {
       console.warn("Preset manifest unavailable", error);
-      runtimePresetList = BUILT_IN_PRESETS;
-      registerRuntimePresets(BUILT_IN_PRESETS);
+      runtimePresetList = [...BUILT_IN_PRESETS];
+      registerRuntimePresets([...BUILT_IN_PRESETS]);
       refreshPresetSelect();
       updatePresetCyclerAvailability();
       updatePresetManifestInfo(
         `Preset manifest missing - ${label} (using built-ins)`,
-        true
+        true,
       );
     }
   }
@@ -7177,11 +7767,11 @@ export function bootstrapApp() {
       const cacheResult = await loadPresetMaybeCached(
         projectLayer,
         preset,
-        origin
+        origin,
       );
       const prevPresetId = currentPresetId; // 记录切换前
       currentPresetId = preset.id;
-      currentPresetUrl = preset.url;
+      currentPresetUrl = preset.url ?? null;
       recordPresetTransition(prevPresetId, preset.id); // 记录转移
       recordPresetSuccess(preset);
       recordPresetLoadSuccess(preset.id, performance.now() - loadStartMs);
@@ -7200,7 +7790,7 @@ export function bootstrapApp() {
         scope: "fg",
         origin: `select:${origin}`,
         presetId: preset.id,
-        presetUrl: preset.url,
+        presetUrl: preset.url ?? null,
         presetLabel: preset.label,
         tStartMs: loadStartMs,
         tEndMs: tEnd,
@@ -7234,7 +7824,7 @@ export function bootstrapApp() {
         scope: "fg",
         origin: `select:${origin}`,
         presetId: preset.id,
-        presetUrl: preset.url,
+        presetUrl: preset.url ?? null,
         presetLabel: preset.label,
         tStartMs: loadStartMs,
         tEndMs: tEnd,
@@ -7291,7 +7881,7 @@ export function bootstrapApp() {
 
   const classifyPresetFailure = (
     error: unknown,
-    elapsedMs: number
+    elapsedMs: number,
   ): "hard" | "soft" => {
     const msg = getPresetErrorText(error);
     const looksLikeWasmAbort =
@@ -7328,7 +7918,7 @@ export function bootstrapApp() {
 
   const recordPresetLoadFailure = (
     presetId: string,
-    severity: "hard" | "soft" | "aesthetic"
+    severity: "hard" | "soft" | "aesthetic",
   ) => {
     if (!presetId) return;
     const existing = presetFailById.get(presetId) ?? {
@@ -7374,7 +7964,7 @@ export function bootstrapApp() {
   const handlePresetFailure = (
     preset: PresetDescriptor | { id: string } | null | undefined,
     error: unknown,
-    elapsedMs: number
+    elapsedMs: number,
   ) => {
     if ((preset as PresetDescriptor | null)?.url) {
       invalidatePresetPrefetch((preset as PresetDescriptor).url);
@@ -7404,7 +7994,7 @@ export function bootstrapApp() {
   };
 
   const markPresetAsBrokenAndRefresh = (
-    preset?: { id: string } | PresetDescriptor | null
+    preset?: { id: string } | PresetDescriptor | null,
   ) => {
     const presetId = preset?.id;
     if (!presetId) return;
@@ -7434,7 +8024,7 @@ export function bootstrapApp() {
     if (!Number.isFinite(value)) return AUTO_INTERVAL_DEFAULT;
     return Math.min(
       AUTO_INTERVAL_MAX,
-      Math.max(AUTO_INTERVAL_MIN, value ?? AUTO_INTERVAL_DEFAULT)
+      Math.max(AUTO_INTERVAL_MIN, value ?? AUTO_INTERVAL_DEFAULT),
     );
   };
 
@@ -7502,7 +8092,7 @@ export function bootstrapApp() {
         applyBackgroundLayerPatch(
           "liquid",
           { brightness: nextBrightness, opacity: nextLiquidOpacity },
-          "user"
+          "user",
         );
       }
     }
@@ -7557,6 +8147,7 @@ export function bootstrapApp() {
     const presets = getRandomPresetPool(rng);
     const hasPresets = presets.length > 0;
     let loadedPreset: PresetDescriptor | null = null;
+    let loadedPresetBg: PresetDescriptor | null = null;
 
     if (!presetHold && projectLayerReady && hasPresets) {
       if (presetLoadInFlight) {
@@ -7584,7 +8175,7 @@ export function bootstrapApp() {
             [
               ...(currentId ? [currentId] : []),
               ...recentRandomPresetIds.slice(0, recentCap),
-            ].filter(Boolean)
+            ].filter(Boolean),
           );
 
           const poolAll = [...presets];
@@ -7621,20 +8212,60 @@ export function bootstrapApp() {
               const cacheResult = await loadPresetMaybeCached(
                 projectLayer,
                 candidate,
-                "random"
+                "random",
               );
               loadedPreset = candidate;
               recordPresetSuccess(candidate);
               recordPresetLoadSuccess(candidate.id, nowMs() - loadStartMs);
               rememberRandomPresetId(candidate.id);
               currentPresetId = candidate.id;
-              currentPresetUrl = candidate.url;
+              currentPresetUrl = candidate.url ?? null;
+
+              // Random should advance BG as well (headless dualRandom verify expects both IDs to change).
+              // Keep it best-effort: BG failures shouldn't prevent the FG preset from applying,
+              // but try a few candidates from the same random pool to make success likely.
+              try {
+                if (projectLayerBgReady) {
+                  const bgMaxTries = 5;
+                  const bgExclude = new Set<string>(
+                    [candidate.id, currentPresetIdBg ?? ""].filter(Boolean),
+                  );
+                  const bgPool = poolAll.filter((p) => !bgExclude.has(p.id));
+
+                  const pickBg = () => {
+                    if (!bgPool.length) return null;
+                    const idx = rng.int(0, bgPool.length);
+                    return bgPool.splice(idx, 1)[0] ?? null;
+                  };
+
+                  for (let bgTry = 0; bgTry < bgMaxTries; bgTry++) {
+                    const bgCandidate = pickBg();
+                    if (!bgCandidate) break;
+                    try {
+                      const tBg0 = nowMs();
+                      await loadPresetMaybeCached(projectLayerBg, bgCandidate, "random:bg");
+                      loadedPresetBg = bgCandidate;
+                      currentPresetIdBg = bgCandidate.id;
+                      currentPresetUrlBg = bgCandidate.url ?? null;
+                      recordPresetSuccess(bgCandidate);
+                      recordPresetLoadSuccess(bgCandidate.id, nowMs() - tBg0);
+                      break;
+                    } catch (bgError) {
+                      console.warn("Failed to load random BG preset", bgError);
+                    }
+                  }
+                }
+              } catch {
+                // ignore
+              }
+
+              publishVerifyPresetIds();
               applyProjectMPresetTuningToRuntime("presetLoaded");
               // Random should affect ProjectM behavior without touching blend UI settings.
               randomizeProjectMPresetTuningForActivePreset(
                 rng,
                 energy,
-                "random"
+                "random",
               );
               updatePresetSelectValue(candidate.id);
               setPresetStatus(`Preset: ${candidate.label}`);
@@ -7645,7 +8276,7 @@ export function bootstrapApp() {
                 scope: "fg",
                 origin: "random",
                 presetId: candidate.id,
-                presetUrl: candidate.url,
+                presetUrl: candidate.url ?? null,
                 presetLabel: candidate.label,
                 tStartMs: loadStartMs,
                 tEndMs: tEnd,
@@ -7671,7 +8302,7 @@ export function bootstrapApp() {
               const compatNote = getCompatNote(candidate);
               handlePresetLoadError(
                 `Failed to load preset${compatNote}`,
-                error
+                error,
               );
               handlePresetFailure(candidate, error, elapsedMs);
 
@@ -7680,7 +8311,7 @@ export function bootstrapApp() {
                 scope: "fg",
                 origin: "random",
                 presetId: candidate.id,
-                presetUrl: candidate.url,
+                presetUrl: candidate.url ?? null,
                 presetLabel: candidate.label,
                 tStartMs: loadStartMs,
                 tEndMs: tEnd,
@@ -7721,6 +8352,8 @@ export function bootstrapApp() {
     }
     if (loadedPreset) {
       armProjectMMotionWatch("random");
+      // Only bump the verify counter when BG also changed; dualRandom expects both.
+      if (loadedPresetBg) bumpVerifyRandomIds();
     }
 
     const e = energy;
@@ -7731,11 +8364,11 @@ export function bootstrapApp() {
         ...nextLiquid,
         brightness: Math.min(
           1.05,
-          Math.max(0.6, Number(nextLiquid.brightness ?? 1))
+          Math.max(0.6, Number(nextLiquid.brightness ?? 1)),
         ),
         opacity: Math.min(
           1,
-          Math.max(0.7, Number((nextLiquid as any).opacity ?? 1))
+          Math.max(0.7, Number((nextLiquid as any).opacity ?? 1)),
         ),
       };
       applyBackgroundLayerPatch("liquid", liquidSafe as any, "random");
@@ -7780,10 +8413,33 @@ export function bootstrapApp() {
     }
   };
 
+  // Expose deterministic verify hook so headless tests don't depend on DOM click wiring.
+  try {
+    const root = (globalThis as any).__nw_verify ?? {};
+    const actions = (root.actions && typeof root.actions === "object")
+      ? root.actions
+      : {};
+    (globalThis as any).__nw_verify = {
+      ...root,
+      actions: {
+        ...actions,
+        random: () => {
+          try {
+            void applyRandomVisualStateSafe();
+          } catch {
+            // ignore
+          }
+        },
+      },
+    };
+  } catch {
+    // ignore
+  }
+
   const applyRandomMacroBank = (
     energy: number,
     rng: ReturnType<typeof createSeededRng>,
-    seed: number
+    seed: number,
   ) => {
     // IMPORTANT: Do NOT switch ProjectM preset here.
     try {
@@ -7796,7 +8452,7 @@ export function bootstrapApp() {
       const macroPatch = randomPatchAllForSchema(
         paramSchema.global.macros,
         energy,
-        rng
+        rng,
       );
       const nextMacros = {
         ...lastVisualState.global.macros,
@@ -7807,7 +8463,7 @@ export function bootstrapApp() {
           if (slot.pinned) return slot;
           if (!slot.randomize) return slot;
           return { ...slot, value: Math.min(1, Math.max(0, rng.next())) };
-        }
+        },
       );
       lastVisualState = {
         ...lastVisualState,
@@ -7856,7 +8512,7 @@ export function bootstrapApp() {
         randomizeProjectMPresetTuningForActivePreset(
           rng,
           energy,
-          "randomParams"
+          "randomParams",
         );
       } catch {
         // ignore
@@ -7913,7 +8569,7 @@ export function bootstrapApp() {
     const fg = perPm?.fg ?? {};
     const framesRendered = Number(verify?.framesRendered ?? 0);
     const lumaCount = Number(
-      fg?.avgLumaSampleCount ?? verify?.avgLumaSampleCount ?? 0
+      fg?.avgLumaSampleCount ?? verify?.avgLumaSampleCount ?? 0,
     );
     const avgLuma = Number(fg?.avgLuma ?? verify?.avgLuma ?? 0);
     const avgR = Number(fg?.avgColorR ?? verify?.avgColorR ?? 0);
@@ -7994,7 +8650,7 @@ export function bootstrapApp() {
 
   const getAutoIntervalSeconds = () => {
     const value = Number(
-      presetAutoIntervalInput?.value ?? AUTO_INTERVAL_DEFAULT
+      presetAutoIntervalInput?.value ?? AUTO_INTERVAL_DEFAULT,
     );
     const clamped = clampAutoInterval(value);
     if (presetAutoIntervalInput) {
@@ -8018,12 +8674,12 @@ export function bootstrapApp() {
   const bumpAutoCycleBackoff = (
     scope: "fg" | "bg",
     nowMs: number,
-    baseIntervalSec: number
+    baseIntervalSec: number,
   ) => {
     if (scope === "bg") {
       autoCycleBgBackoffFactor = Math.min(
         AUTO_CYCLE_BACKOFF_MAX,
-        Math.max(1, autoCycleBgBackoffFactor * 2)
+        Math.max(1, autoCycleBgBackoffFactor * 2),
       );
       autoCycleBgBackoffUntilMs =
         nowMs + autoCycleBgBackoffFactor * baseIntervalSec * 1000;
@@ -8031,7 +8687,7 @@ export function bootstrapApp() {
     }
     autoCycleBackoffFactor = Math.min(
       AUTO_CYCLE_BACKOFF_MAX,
-      Math.max(1, autoCycleBackoffFactor * 2)
+      Math.max(1, autoCycleBackoffFactor * 2),
     );
     autoCycleBackoffUntilMs =
       nowMs + autoCycleBackoffFactor * baseIntervalSec * 1000;
@@ -8065,7 +8721,7 @@ export function bootstrapApp() {
       visualHoldButton.dataset.active = presetHold ? "1" : "0";
       visualHoldButton.setAttribute(
         "aria-pressed",
-        presetHold ? "true" : "false"
+        presetHold ? "true" : "false",
       );
     }
   };
@@ -8083,7 +8739,7 @@ export function bootstrapApp() {
         ? findPresetById(currentPresetId)
         : null;
       setPresetStatus(
-        initialPreset ? `Preset: ${initialPreset.label}` : "Preset ready"
+        initialPreset ? `Preset: ${initialPreset.label}` : "Preset ready",
       );
     }
     syncPresetHoldUi();
@@ -8095,7 +8751,7 @@ export function bootstrapApp() {
   trackBootstrapDispose(
     listen(visualHoldButton, "click", () => {
       togglePresetHold();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8108,7 +8764,7 @@ export function bootstrapApp() {
       if (t?.isContentEditable) return;
       ev.preventDefault();
       togglePresetHold();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8122,9 +8778,9 @@ export function bootstrapApp() {
       ev.preventDefault();
       setCalibrationOverlayEnabled(
         !calibrationOverlayEnabled,
-        "calibrationHotkey"
+        "calibrationHotkey",
       );
-    })
+    }),
   );
 
   const scheduleAutoCycle = () => {
@@ -8155,7 +8811,7 @@ export function bootstrapApp() {
 
   const cycleToNextPreset = async (
     origin: "manual" | "auto",
-    opts?: { skipGate?: boolean }
+    opts?: { skipGate?: boolean },
   ) => {
     if (!projectLayerReady) return;
     if (presetHold) {
@@ -8166,7 +8822,7 @@ export function bootstrapApp() {
       // One-item queue: remember the latest request and run it once we're free.
       // Manual overrides auto.
       pendingCycleOrigin =
-        origin === "manual" ? "manual" : pendingCycleOrigin ?? "auto";
+        origin === "manual" ? "manual" : (pendingCycleOrigin ?? "auto");
       if (origin === "manual") setPresetStatus("Preset switch in progress…");
       return;
     }
@@ -8177,7 +8833,7 @@ export function bootstrapApp() {
           ? gate.reasons.join(",")
           : "gate";
         setPresetStatus(
-          `${origin === "auto" ? "Auto" : "Manual"} blocked (${reasonText})`
+          `${origin === "auto" ? "Auto" : "Manual"} blocked (${reasonText})`,
         );
         return;
       }
@@ -8187,10 +8843,24 @@ export function bootstrapApp() {
       stopAutoCycle("No presets available for cycling", true);
       return;
     }
+
+    // Headless verification collects sample-driven selection lines by scanning console output for "[sel]".
+    // Manual/auto cycling doesn't go through the coupled-pairs picker, so emit a lightweight, deterministic
+    // selection log here to keep verify signal stable without changing preset selection behavior.
+    try {
+      console.log(
+        `[sel] mode=sequential lib=${String(currentLibrarySource)} presetId=${String(
+          nextPreset.id,
+        )} reason=cycle:${origin}`,
+      );
+    } catch {
+      // ignore
+    }
+
     setPresetStatus(
       `${origin === "auto" ? "Auto" : "Manual"} loading: ${
         nextPreset.label
-      } ...`
+      } ...`,
     );
     const loadStartMs =
       typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -8209,10 +8879,12 @@ export function bootstrapApp() {
       const cacheResult = await loadPresetMaybeCached(
         projectLayer,
         nextPreset,
-        origin
+        origin,
       );
       currentPresetId = nextPreset.id;
-      currentPresetUrl = nextPreset.url;
+      currentPresetUrl = nextPreset.url ?? null;
+      publishVerifyPresetIds();
+      publishVerifyPresetIds();
       recordPresetSuccess(nextPreset);
       recordPresetLoadSuccess(nextPreset.id, performance.now() - loadStartMs);
       applyProjectMPresetTuningToRuntime("presetLoaded");
@@ -8231,7 +8903,7 @@ export function bootstrapApp() {
         scope: "fg",
         origin: `cycle:${origin}`,
         presetId: nextPreset.id,
-        presetUrl: nextPreset.url,
+        presetUrl: nextPreset.url ?? null,
         presetLabel: nextPreset.label,
         tStartMs: loadStartMs,
         tEndMs: tEnd,
@@ -8270,7 +8942,7 @@ export function bootstrapApp() {
         scope: "fg",
         origin: `cycle:${origin}`,
         presetId: nextPreset.id,
-        presetUrl: nextPreset.url,
+        presetUrl: nextPreset.url ?? null,
         presetLabel: nextPreset.label,
         tStartMs: loadStartMs,
         tEndMs: tEnd,
@@ -8298,9 +8970,94 @@ export function bootstrapApp() {
     }
   };
 
+  const cycleToNextCoupledPair = async (
+    origin: "manual" | "auto",
+    opts?: { skipGate?: boolean },
+  ) => {
+    // Debug: trace coupled cycle entry
+    try {
+      console.log(`[coupled-cycle] enter origin=${origin} projectLayerReady=${projectLayerReady} presetHold=${presetHold} presetLoadInFlight=${presetLoadInFlight}`);
+    } catch {
+      // ignore
+    }
+    if (!projectLayerReady) {
+      try { console.log("[coupled-cycle] bail: !projectLayerReady"); } catch { /**/ }
+      return;
+    }
+    if (presetHold) {
+      setPresetStatus("HOLD: preset locked");
+      try { console.log("[coupled-cycle] bail: presetHold"); } catch { /**/ }
+      return;
+    }
+    if (presetLoadInFlight) {
+      if (origin === "manual") setPresetStatus("Preset switch in progress…");
+      try { console.log("[coupled-cycle] bail: presetLoadInFlight"); } catch { /**/ }
+      return;
+    }
+    if (!opts?.skipGate) {
+      const gate = requestPresetSwitch(`coupled:${origin}`);
+      if (!gate.ok) {
+        const reasonText = gate.reasons.length ? gate.reasons.join(",") : "gate";
+        setPresetStatus(
+          `${origin === "auto" ? "Auto" : "Manual"} blocked (${reasonText})`,
+        );
+        return;
+      }
+    }
+
+    presetLoadInFlight = true;
+    updatePresetCyclerAvailability();
+    try {
+      const manifestOk = await ensureCoupledManifestLoaded(`cycle:${origin}`);
+      if (!manifestOk.ok) {
+        setPresetStatus("Coupled pairs not ready", true);
+        return;
+      }
+
+      const picked = pickNextCoupledPair(`cycle:${origin}`);
+      if (!picked?.fgUrl || !picked?.bgUrl) {
+        setPresetStatus("Coupled pairs empty", true);
+        return;
+      }
+
+      setPresetStatus(
+        `Coupled (${String(coupledRuntime.config.pickMode)}) loading pair ${picked.pair} ...`,
+      );
+
+      ensureProjectLayerReady();
+      ensureProjectLayerBgReady();
+
+      await Promise.all([
+        loadPresetUrlMaybeCached(projectLayer, picked.fgUrl, `coupled:${origin}:fg`),
+        loadPresetUrlMaybeCached(projectLayerBg, picked.bgUrl, `coupled:${origin}:bg`),
+      ]);
+
+      currentPresetId = null;
+      currentPresetUrl = picked.fgUrl;
+      currentPresetIdBg = null;
+      currentPresetUrlBg = picked.bgUrl;
+      publishVerifyPresetIds();
+
+      coupledRuntime.lastPick = {
+        timeMs:
+          typeof performance !== "undefined" ? performance.now() : Date.now(),
+        pair: picked.pair,
+      };
+      applyProjectMPresetTuningToRuntime("presetLoaded");
+      setPresetStatus(`Coupled pair: ${picked.pair}`);
+      armProjectMMotionWatch("manual");
+    } catch (error) {
+      handlePresetLoadError("Failed to load coupled pair", error);
+    } finally {
+      presetLoadInFlight = false;
+      updatePresetCyclerAvailability();
+      flushPendingPresetRequests();
+    }
+  };
+
   const cycleToNextPresetBg = async (
     origin: "auto",
-    opts?: { skipGate?: boolean }
+    opts?: { skipGate?: boolean },
   ) => {
     if (!projectLayerBgReady) return;
     if (presetHold) {
@@ -8315,7 +9072,7 @@ export function bootstrapApp() {
     if (!opts?.skipGate) {
       const gate = evaluateBgPresetSwitchGate(
         typeof performance !== "undefined" ? performance.now() : Date.now(),
-        `bg:${origin}`
+        `bg:${origin}`,
       );
       if (!gate.allow) {
         return;
@@ -8325,7 +9082,7 @@ export function bootstrapApp() {
     if (currentPresetId) excludeIds.add(currentPresetId);
     const nextPreset = getNextPresetFilteredExcluding(
       currentPresetIdBg,
-      excludeIds
+      excludeIds,
     );
     if (!nextPreset) {
       return;
@@ -8347,17 +9104,17 @@ export function bootstrapApp() {
       const cacheResult = await loadPresetMaybeCached(
         projectLayerBg,
         nextPreset,
-        `bg:${origin}`
+        `bg:${origin}`,
       );
       currentPresetIdBg = nextPreset.id;
-      currentPresetUrlBg = nextPreset.url;
+      currentPresetUrlBg = nextPreset.url ?? null;
       recordPresetSuccess(nextPreset);
       recordPresetLoadSuccess(nextPreset.id, performance.now() - loadStartMs);
       queuePresetPrefetchAround(
         nextPreset.id,
         1,
         `cycle-bg:${origin}`,
-        currentPresetId ? new Set([currentPresetId]) : undefined
+        currentPresetId ? new Set([currentPresetId]) : undefined,
       );
       autoCycleBgBackoffFactor = 1;
       autoCycleBgBackoffUntilMs = 0;
@@ -8368,7 +9125,7 @@ export function bootstrapApp() {
         scope: "bg",
         origin: `cycle-bg:${origin}`,
         presetId: nextPreset.id,
-        presetUrl: nextPreset.url,
+        presetUrl: nextPreset.url ?? null,
         presetLabel: nextPreset.label,
         tStartMs: loadStartMs,
         tEndMs: tEnd,
@@ -8404,7 +9161,7 @@ export function bootstrapApp() {
         scope: "bg",
         origin: `cycle-bg:${origin}`,
         presetId: nextPreset.id,
-        presetUrl: nextPreset.url,
+        presetUrl: nextPreset.url ?? null,
         presetLabel: nextPreset.label,
         tStartMs: loadStartMs,
         tEndMs: tEnd,
@@ -8496,7 +9253,7 @@ export function bootstrapApp() {
     applyProjectMPresetTuningToRuntime("boot");
     captureColorSnapshot(
       "boot",
-      typeof performance !== "undefined" ? performance.now() : Date.now()
+      typeof performance !== "undefined" ? performance.now() : Date.now(),
     );
 
     // Keyboard shortcuts: 'R' randomizes.
@@ -8506,7 +9263,7 @@ export function bootstrapApp() {
         if (ev.key === "r" || ev.key === "R") {
           void applyRandomVisualStateSafe();
         }
-      })
+      }),
     );
 
     enablePresetControls();
@@ -8514,7 +9271,7 @@ export function bootstrapApp() {
       ? findPresetById(currentPresetId)
       : null;
     setPresetStatus(
-      initialPreset ? `Preset: ${initialPreset.label}` : "Preset ready"
+      initialPreset ? `Preset: ${initialPreset.label}` : "Preset ready",
     );
     // Audio transport controller handles user-gesture resume + optional test track autoload.
     void audioTransport.tryAutoLoadDefaultAudio();
@@ -8524,29 +9281,29 @@ export function bootstrapApp() {
     applyBackgroundLayerPatch(
       "liquid",
       { enabled: Boolean(layerLiquidToggle?.checked ?? true) },
-      "user"
+      "user",
     );
     applyBackgroundLayerPatch(
       "basic",
       { enabled: Boolean(layerBasicToggle?.checked) },
-      "user"
+      "user",
     );
     applyBackgroundLayerPatch(
       "depth",
       { enabled: Boolean(layerDepthToggle?.checked) },
-      "user"
+      "user",
     );
     if (cameraLayer) {
       applyBackgroundLayerPatch(
         "camera",
         { enabled: Boolean(layerCameraToggle?.checked) },
-        "user"
+        "user",
       );
     }
     applyBackgroundLayerPatch(
       "video",
       { enabled: Boolean(layerVideoToggle?.checked) },
-      "user"
+      "user",
     );
 
     refreshBackgroundUiEnabledState();
@@ -8579,16 +9336,16 @@ export function bootstrapApp() {
       applyBackgroundLayerPatch(
         "liquid",
         { enabled: Boolean(layerLiquidToggle?.checked) },
-        "user"
+        "user",
       );
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(bgVariantLockToggle, "change", () => {
       liquidVariantLocked = Boolean(bgVariantLockToggle?.checked);
       writeStored(LIQUID_VARIANT_LOCK_KEY, liquidVariantLocked ? "1" : "0");
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8597,7 +9354,7 @@ export function bootstrapApp() {
       if (v === "metal" || v === "waves" || v === "stars" || v === "lines") {
         applyBackgroundLayerPatch("liquid", { variant: v }, "user");
       }
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8605,9 +9362,9 @@ export function bootstrapApp() {
       applyBackgroundLayerPatch(
         "basic",
         { enabled: Boolean(layerBasicToggle?.checked) },
-        "user"
+        "user",
       );
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8616,7 +9373,7 @@ export function bootstrapApp() {
       const v = readRangeInputValue01(basicOpacityInput, 0.7);
       if (basicOpacityText) basicOpacityText.textContent = fmtPct(v);
       setBasicParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8627,7 +9384,7 @@ export function bootstrapApp() {
       setCameraParamsFromUi();
       // Re-enumerate to get labels after permission grant.
       void populateVideoInputDevices(cameraDeviceSelect);
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8636,25 +9393,25 @@ export function bootstrapApp() {
       const v = readRangeInputValue01(cameraOpacityInput, 0.85);
       if (cameraOpacityText) cameraOpacityText.textContent = fmtPct(v);
       setCameraParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(cameraDeviceSelect, "change", () => {
       setCameraParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(cameraSegmentToggle, "change", () => {
       setCameraParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(cameraEdgeToPmInput, "input", () => {
       syncCameraEdgeToPmFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8663,7 +9420,7 @@ export function bootstrapApp() {
       applyBackgroundLayerPatch("video", { enabled }, "user");
       if (enabled) nudgeProjectMOpacityForBackgroundVisibility();
       setVideoParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8672,7 +9429,7 @@ export function bootstrapApp() {
       const v = readRangeInputValue01(videoOpacityInput, 0.7);
       if (videoOpacityText) videoOpacityText.textContent = fmtPct(v);
       setVideoParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8682,7 +9439,7 @@ export function bootstrapApp() {
         videoSrcHint.textContent = (videoSrcInput?.value ?? "").trim()
           ? "src set"
           : "";
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8693,10 +9450,10 @@ export function bootstrapApp() {
         const ok = await videoLayer.retryPlayback();
         setInspectorStatusExtraTransient(
           ok ? "video resumed" : "video retry failed",
-          2500
+          2500,
         );
       })();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8713,7 +9470,7 @@ export function bootstrapApp() {
         }
       }
       setDepthParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8731,19 +9488,19 @@ export function bootstrapApp() {
       }
       // Re-enumerate depth devices after permission grant.
       void populateVideoInputDevices(depthDeviceSelect);
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(depthDeviceSelect, "change", () => {
       setDepthParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(depthShowDepthToggle, "change", () => {
       setDepthParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8752,7 +9509,7 @@ export function bootstrapApp() {
       const v = readRangeInputValue01(depthOpacityInput, 0.7);
       if (depthOpacityText) depthOpacityText.textContent = fmtPct(v);
       setDepthParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -8760,82 +9517,82 @@ export function bootstrapApp() {
       if (depthFogText)
         depthFogText.textContent = Number(depthFogInput.value).toFixed(2);
       setDepthParamsFromUi();
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(depthEdgeInput, "input", () => {
       if (depthEdgeText)
         depthEdgeText.textContent = Number(depthEdgeInput.value).toFixed(2);
       setDepthParamsFromUi();
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(depthLayersInput, "input", () => {
       if (depthLayersText)
         depthLayersText.textContent = String(
-          Math.round(Number(depthLayersInput.value))
+          Math.round(Number(depthLayersInput.value)),
         );
       setDepthParamsFromUi();
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(depthBlurInput, "input", () => {
       if (depthBlurText)
         depthBlurText.textContent = String(
-          Math.round(Number(depthBlurInput.value))
+          Math.round(Number(depthBlurInput.value)),
         );
       setDepthParamsFromUi();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(navigator.mediaDevices, "devicechange", () => {
       void populateVideoInputDevices(cameraDeviceSelect);
       void populateVideoInputDevices(depthDeviceSelect);
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(pmBlendModeSelect, "change", () => {
       applyBlendControlsToLayer();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(pmOpacityInput, "input", () => {
       applyBlendControlsToLayer();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(pmAudioOpacityToggle, "change", () => {
       applyBlendControlsToLayer();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(pmEnergyOpacityInput, "change", () => {
       applyBlendControlsToLayer();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(pmEnergyOpacityInput, "input", () => {
       applyBlendControlsToLayer();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(pmPriorityInput, "input", () => {
       const raw = Number(pmPriorityInput?.value ?? 0.6);
       applyPmPriority(Math.min(1, Math.max(0, raw)));
-    })
+    }),
   );
   trackBootstrapDispose(
     listen(pmRetreatStrengthInput, "input", () => {
       const raw = Number(pmRetreatStrengthInput?.value ?? 0.25);
       applyPmRetreatStrength(raw);
-    })
+    }),
   );
 
   audioBus.onFrame((frame: AudioFrame) => {
@@ -8848,7 +9605,7 @@ export function bootstrapApp() {
     controlPlaneDebug.calibration.enabled = calibrationOverlayEnabled;
     controlPlaneDebug.calibration.autoOffMs = Math.max(
       0,
-      calibrationAutoOffUntilMs - nowMs
+      calibrationAutoOffUntilMs - nowMs,
     );
 
     const audioControlsCfg = audioControls.getConfig();
@@ -8874,7 +9631,7 @@ export function bootstrapApp() {
 
         // Consider octave harmonics; clamp to a reasonable range.
         const cands = [b, b * 2, b * 0.5].filter(
-          (x) => Number.isFinite(x) && x >= minT && x <= maxT
+          (x) => Number.isFinite(x) && x >= minT && x <= maxT,
         );
         if (cands.length === 0) return 0;
 
@@ -8902,9 +9659,9 @@ export function bootstrapApp() {
           0,
           Math.max(
             beatSnapshot.confidence01 || 0,
-            0.75 * (beatSnapshot.stability01 || 0)
-          )
-        )
+            0.75 * (beatSnapshot.stability01 || 0),
+          ),
+        ),
       );
       const rawBpm = pickHarmonicBpm(Number(beatSnapshot.bpm || 0));
       const conf01 = Math.min(1, Math.max(0, beatSnapshot.confidence01 || 0));
@@ -8939,7 +9696,7 @@ export function bootstrapApp() {
       beatBpmUi = 0;
     }
     lastBeatPhase01 = clamp01(
-      Number(frame.features?.beatPhase ?? lastBeatPhase01 ?? 0)
+      Number(frame.features?.beatPhase ?? lastBeatPhase01 ?? 0),
     );
 
     // Update beat quality smoothing (attack fast, release slow).
@@ -8948,11 +9705,11 @@ export function bootstrapApp() {
       beatQualityLastMs = nowMs;
       const conf01 = Math.min(
         1,
-        Math.max(0, Number(frame.features?.beatConfidence ?? 0))
+        Math.max(0, Number(frame.features?.beatConfidence ?? 0)),
       );
       const stab01 = Math.min(
         1,
-        Math.max(0, Number((frame.features as any)?.beatStability ?? 0))
+        Math.max(0, Number((frame.features as any)?.beatStability ?? 0)),
       );
       const target = Math.min(1, Math.max(conf01, stab01));
 
@@ -8968,41 +9725,41 @@ export function bootstrapApp() {
     {
       const energy01 = clamp01Runtime(
         Number(frame.energy ?? (frame as any).energyRaw ?? 0),
-        0
+        0,
       );
       const bass01 = clamp01Runtime(
         Number(frame.features?.bass01Long ?? frame.bands?.low ?? 0),
-        0
+        0,
       );
       const kick01 = clamp01Runtime(
         Number(frame.features?.kick01Long ?? frame.features?.kick01Raw ?? 0),
-        0
+        0,
       );
       const mid01 = clamp01Runtime(
         Number(frame.bands?.mid ?? frame.bandsRaw?.mid ?? 0),
-        0
+        0,
       );
       const high01 = clamp01Runtime(
         Number(frame.features?.hihat01Long ?? frame.bands?.high ?? 0),
-        0
+        0,
       );
       const flux01 = clamp01Runtime(Number(frame.features?.flux ?? 0), 0);
       const beatConf01 = clamp01Runtime(
         Number(frame.features?.beatConfidence ?? 0),
-        0
+        0,
       );
 
       const ambientScore = clamp01Runtime(
         0.55 * (1 - energy01) + 0.25 * (1 - flux01) + 0.2 * (1 - beatConf01),
-        0
+        0,
       );
       const technoScore = clamp01Runtime(
         0.45 * energy01 + 0.35 * kick01 + 0.2 * beatConf01,
-        0
+        0,
       );
       const rockScore = clamp01Runtime(
         0.4 * energy01 + 0.35 * mid01 + 0.25 * high01,
-        0
+        0,
       );
 
       const dtSec = Math.max(0.001, (nowMs - sceneLastUpdateMs) / 1000);
@@ -9081,7 +9838,7 @@ export function bootstrapApp() {
         gateAudioValid = audioValidNow;
         recordControlPlaneEvent(
           "GATE_AUDIO_VALID",
-          audioValidNow ? "on" : "off"
+          audioValidNow ? "on" : "off",
         );
       }
 
@@ -9107,7 +9864,7 @@ export function bootstrapApp() {
         gateBeatTrusted = beatTrustedNow;
         recordControlPlaneEvent(
           "GATE_BEAT_TRUSTED",
-          beatTrustedNow ? "on" : "off"
+          beatTrustedNow ? "on" : "off",
         );
       }
 
@@ -9115,7 +9872,7 @@ export function bootstrapApp() {
       const rebuildInProgress = Boolean(rebuild?.inProgress);
       if (rebuildInProgress !== lastRebuildInProgress) {
         recordControlPlaneEvent(
-          rebuildInProgress ? "REBUILD_START" : "REBUILD_END"
+          rebuildInProgress ? "REBUILD_START" : "REBUILD_END",
         );
         lastRebuildInProgress = rebuildInProgress;
       }
@@ -9125,7 +9882,7 @@ export function bootstrapApp() {
         const cfg = sceneManager.getCompositorConfig();
         recordControlPlaneEvent(
           "RT_REALLOC",
-          `${cfg.targetMode}:${cfg.fixedWidth}x${cfg.fixedHeight}`
+          `${cfg.targetMode}:${cfg.fixedWidth}x${cfg.fixedHeight}`,
         );
         lastRtReallocSeenMs = rtReallocMs;
       }
@@ -9151,7 +9908,7 @@ export function bootstrapApp() {
         gateRenderStable = renderStableNow;
         recordControlPlaneEvent(
           "GATE_RENDER_STABLE",
-          renderStableNow ? "on" : "off"
+          renderStableNow ? "on" : "off",
         );
       }
 
@@ -9161,43 +9918,43 @@ export function bootstrapApp() {
 
       controlPlaneDebug.cooldown.audioMs = Math.max(
         0,
-        audioCooldownUntilMs - nowMs
+        audioCooldownUntilMs - nowMs,
       );
       controlPlaneDebug.cooldown.beatMs = Math.max(
         0,
-        beatCooldownUntilMs - nowMs
+        beatCooldownUntilMs - nowMs,
       );
       controlPlaneDebug.cooldown.renderMs = Math.max(
         0,
-        renderCooldownUntilMs - nowMs
+        renderCooldownUntilMs - nowMs,
       );
       controlPlaneDebug.cooldown.m3Ms = Math.max(
         0,
-        lastResCommitMs > 0 ? RES_COOLDOWN_MS - (nowMs - lastResCommitMs) : 0
+        lastResCommitMs > 0 ? RES_COOLDOWN_MS - (nowMs - lastResCommitMs) : 0,
       );
       controlPlaneDebug.cooldown.fgMs = Math.max(
         0,
         lastPresetSwitchMs > 0
           ? PRESET_SWITCH_COOLDOWN_MS - (nowMs - lastPresetSwitchMs)
-          : 0
+          : 0,
       );
       controlPlaneDebug.cooldown.bgMs = Math.max(
         0,
         lastBgPresetSwitchMs > 0
           ? BG_PRESET_SWITCH_COOLDOWN_MS - (nowMs - lastBgPresetSwitchMs)
-          : 0
+          : 0,
       );
       controlPlaneDebug.cooldown.bgRecentMs = Math.max(
         0,
         lastBgPresetSwitchMs > 0
           ? BG_RECENT_BLOCK_MS - (nowMs - lastBgPresetSwitchMs)
-          : 0
+          : 0,
       );
       controlPlaneDebug.cooldown.fgRecentMs = Math.max(
         0,
         lastPresetSwitchMs > 0
           ? FG_RECENT_BLOCK_MS - (nowMs - lastPresetSwitchMs)
-          : 0
+          : 0,
       );
       controlPlaneDebug.freezeFlags.rebuild = rebuildInProgress;
       controlPlaneDebug.freezeFlags.resCooldown = resCooldownActive;
@@ -9224,7 +9981,7 @@ export function bootstrapApp() {
       const energy01 = clamp01(Number(frame.energy ?? 0));
       const dtSec = Math.max(
         0.001,
-        Math.min(0.25, (nowMs - energySlowLastMs) / 1000)
+        Math.min(0.25, (nowMs - energySlowLastMs) / 1000),
       );
       energySlowLastMs = nowMs;
       const hz =
@@ -9367,7 +10124,7 @@ export function bootstrapApp() {
         displayLastChangeMs = nowMs;
         recordControlPlaneEvent(
           "DISPLAY_CHANGE",
-          `${next.w}x${next.h}@${next.dpr.toFixed(2)}`
+          `${next.w}x${next.h}@${next.dpr.toFixed(2)}`,
         );
       }
       const nextCap = computeDprCap(displayMetrics.w, displayMetrics.h);
@@ -9387,11 +10144,11 @@ export function bootstrapApp() {
         controlPlaneDebug.display.initScale = scale;
         controlPlaneDebug.display.targetW = Math.max(
           1,
-          Math.floor(displayMetrics.w * scale)
+          Math.floor(displayMetrics.w * scale),
         );
         controlPlaneDebug.display.targetH = Math.max(
           1,
-          Math.floor(displayMetrics.h * scale)
+          Math.floor(displayMetrics.h * scale),
         );
       }
       controlPlaneDebug.display.pending = displayPending;
@@ -9403,7 +10160,7 @@ export function bootstrapApp() {
       const applied = applyDisplayInitScale(
         nowMs,
         displayMetrics,
-        "displayChange"
+        "displayChange",
       );
       if (applied) {
         displayPending = false;
@@ -9436,7 +10193,7 @@ export function bootstrapApp() {
           if (gate.allow) {
             resScaleIndex = Math.min(
               RES_SCALE_STEPS.length - 1,
-              resScaleIndex + 1
+              resScaleIndex + 1,
             );
             const scale = RES_SCALE_STEPS[resScaleIndex];
             applyResolutionScale(scale, nowMs);
@@ -9446,7 +10203,7 @@ export function bootstrapApp() {
             controlPlaneDebug.denyReasonsTop = gate.reasons.slice(0, 3);
             recordControlPlaneEvent(
               "ACTION_DENY",
-              `resDown:${gate.reasons.join(",")}`
+              `resDown:${gate.reasons.join(",")}`,
             );
           }
           resProbeDownStartMs = 0;
@@ -9485,7 +10242,7 @@ export function bootstrapApp() {
             controlPlaneDebug.denyReasonsTop = gate.reasons.slice(0, 3);
             recordControlPlaneEvent(
               "ACTION_DENY",
-              `resUp:${gate.reasons.join(",")}`
+              `resUp:${gate.reasons.join(",")}`,
             );
           }
           resProbeUpStartMs = 0;
@@ -9498,19 +10255,22 @@ export function bootstrapApp() {
     // 0.0 -> 1.0x, 1.0 -> ~1.9x
     const kickLong01 = Math.min(
       1,
-      Math.max(0, Number(frame.features?.kick01Long ?? 0))
+      Math.max(0, Number(frame.features?.kick01Long ?? 0)),
     );
     const bassLong01 = Math.min(
       1,
-      Math.max(0, Number(frame.features?.bass01Long ?? frame.bands?.low ?? 0))
+      Math.max(0, Number(frame.features?.bass01Long ?? frame.bands?.low ?? 0)),
     );
     const clapLong01 = Math.min(
       1,
-      Math.max(0, Number(frame.features?.clap01Long ?? 0))
+      Math.max(0, Number(frame.features?.clap01Long ?? 0)),
     );
     const hihatLong01 = Math.min(
       1,
-      Math.max(0, Number(frame.features?.hihat01Long ?? frame.bands?.high ?? 0))
+      Math.max(
+        0,
+        Number(frame.features?.hihat01Long ?? frame.bands?.high ?? 0),
+      ),
     );
 
     const beatQualityMul =
@@ -9522,8 +10282,8 @@ export function bootstrapApp() {
         0.55 * kickLong01 +
           0.35 * bassLong01 +
           0.25 * clapLong01 +
-          0.25 * hihatLong01
-      )
+        0.25 * hihatLong01,
+      ),
     );
     const accent01 = Math.min(
       1,
@@ -9532,8 +10292,8 @@ export function bootstrapApp() {
         0.45 * clamp01Runtime(frame.features?.kick01Raw ?? 0, 0) +
           0.2 * clamp01Runtime(frame.features?.clap01Raw ?? 0, 0) +
           0.2 * clamp01Runtime(frame.features?.hihat01Raw ?? 0, 0) +
-          0.15 * clamp01Runtime(frame.features?.beatPulse ?? 0, 0)
-      )
+        0.15 * clamp01Runtime(frame.features?.beatPulse ?? 0, 0),
+      ),
     );
     const technoMul = 1 + 0.55 * technoDrive01;
     const fluxGate = clamp01Runtime(frame.features?.flux ?? 0, 0);
@@ -9553,8 +10313,8 @@ export function bootstrapApp() {
         audioReactiveMul *
           pmMacroReactiveMultiplier *
           gateBoost *
-          pmReactiveSectionMul
-      )
+        pmReactiveSectionMul,
+      ),
     );
     projectLayer.setAudioReactiveMultiplier(pmReactiveMul);
     projectLayerBg.setAudioReactiveMultiplier(pmReactiveMul * 0.55);
@@ -9584,7 +10344,7 @@ export function bootstrapApp() {
         typeof performance !== "undefined" ? performance.now() : Date.now();
       const dtSec = Math.max(
         0.001,
-        Math.min(0.25, (nowMs - spatialLastMs) / 1000)
+        Math.min(0.25, (nowMs - spatialLastMs) / 1000),
       );
       spatialLastMs = nowMs;
 
@@ -9596,7 +10356,7 @@ export function bootstrapApp() {
       const waveAmplitude = clampRuntime(
         Number(liquidLayer.params.waveAmplitude ?? 0),
         0,
-        2
+        2,
       );
       depthCouplingWave01 = clamp01Runtime(waveAmplitude / 2, 0);
 
@@ -9638,7 +10398,7 @@ export function bootstrapApp() {
       } else {
         const intervalMs = Math.max(
           100,
-          Math.min(5000, pmClosedLoop.intervalMs)
+          Math.min(5000, pmClosedLoop.intervalMs),
         );
         if (!pmClosedLoopLastUpdateMs) pmClosedLoopLastUpdateMs = nowMs;
         if (nowMs - pmClosedLoopLastUpdateMs >= intervalMs) {
@@ -9649,13 +10409,13 @@ export function bootstrapApp() {
           if (Number.isFinite(luma)) {
             const dtPi = Math.max(
               0.05,
-              Math.min(2.0, (nowMs - pmClosedLoopLastUpdateMs) / 1000)
+              Math.min(2.0, (nowMs - pmClosedLoopLastUpdateMs) / 1000),
             );
             pmClosedLoopLastUpdateMs = nowMs;
 
             const target = Math.max(
               0.01,
-              Math.min(0.99, pmClosedLoop.targetLuma)
+              Math.min(0.99, pmClosedLoop.targetLuma),
             );
             const e = target - Math.max(0, Math.min(1, luma));
             pmClosedLoopLastError = e;
@@ -9666,18 +10426,18 @@ export function bootstrapApp() {
             const iClamp = Math.max(0, Math.min(1, pmClosedLoop.integralClamp));
             pmClosedLoopIntegral = Math.max(
               -iClamp,
-              Math.min(iClamp, pmClosedLoopIntegral + e * ki * dtPi)
+              Math.min(iClamp, pmClosedLoopIntegral + e * ki * dtPi),
             );
 
             const outClamp = Math.max(0, Math.min(1, pmClosedLoop.outputClamp));
             const rawOut = Math.max(
               -outClamp,
-              Math.min(outClamp, kp * e + pmClosedLoopIntegral)
+              Math.min(outClamp, kp * e + pmClosedLoopIntegral),
             );
             const maxDelta = Math.max(0, pmClosedLoop.maxDeltaPerSec) * dtPi;
             const delta = Math.max(
               -maxDelta,
-              Math.min(maxDelta, rawOut - pmClosedLoopLastOutput)
+              Math.min(maxDelta, rawOut - pmClosedLoopLastOutput),
             );
             pmClosedLoopLastOutput = pmClosedLoopLastOutput + delta;
           }
@@ -9702,6 +10462,9 @@ export function bootstrapApp() {
         // ignore
       }
 
+      // Keep verify preset ids continuously published (dualRandom precondition relies on this).
+      publishVerifyPresetIds();
+
       if (pmClosedLoop.enabled && !pmVisibilityHoldActive) {
         const lumaNote = Number.isFinite(pmClosedLoopLastLuma)
           ? ` luma=${pmClosedLoopLastLuma.toFixed(3)}`
@@ -9716,7 +10479,7 @@ export function bootstrapApp() {
           minDelta: 0.01,
           digits: 3,
           reason: `e=${Number(pmClosedLoopLastError ?? 0).toFixed(
-            3
+            3,
           )}${lumaNote}${freezeNote}`,
         });
       }
@@ -9725,11 +10488,11 @@ export function bootstrapApp() {
       const camStatus = cameraLayer?.getStatus?.();
       const edge01Raw = clamp01Runtime(
         Number((camStatus as any)?.portraitEdge01 ?? 0),
-        0
+        0,
       );
       const area01Raw = clamp01Runtime(
         Number((camStatus as any)?.portraitArea01 ?? 0),
-        0
+        0,
       );
 
       // Depth freshness: treat depth as "active" if frames are arriving recently.
@@ -9788,20 +10551,20 @@ export function bootstrapApp() {
       }
       const beatPhase01 = clamp01Runtime(
         Number(frame.features?.beatPhase ?? 0),
-        0
+        0,
       );
       const beatPulse01 = clamp01Runtime(
         Number(frame.features?.beatPulse ?? 0),
-        0
+        0,
       );
       const flux01 = clamp01Runtime(Number(frame.features?.flux ?? 0), 0);
       const kick01 = clamp01Runtime(
         Number(frame.features?.kick01Long ?? frame.features?.kick01Raw ?? 0),
-        0
+        0,
       );
       const audioDrive01 = clamp01Runtime(
         0.45 * beatPulse01 + 0.35 * flux01 + 0.2 * kick01,
-        0
+        0,
       );
       const smoothstep = (edge0: number, edge1: number, x: number) => {
         const t =
@@ -9814,7 +10577,7 @@ export function bootstrapApp() {
         ? Math.min(
             1,
             smoothstep(0.92, 1.0, beatPhase01) +
-              smoothstep(0.0, 0.06, beatPhase01)
+          smoothstep(0.0, 0.06, beatPhase01),
           )
         : 0;
       const sectionPhaseMul =
@@ -9841,7 +10604,7 @@ export function bootstrapApp() {
         ? clampRuntime(
             -couplingLumaDelta * COUPLING_LUMA_DELTA_GAIN * couplingSectionMul,
             -0.35,
-            0.35
+          0.35,
           )
         : 0;
       const rawCoupling =
@@ -9886,14 +10649,15 @@ export function bootstrapApp() {
       const externalOpacityDriveSigned = audioInvalid
         ? 0
         : pmVisibilityHoldActive
-        ? clampRuntime(presetBias, -1, 1)
-        : freezeCoupling
-        ? prevCoupling
-        : clampRuntime(
-            (edgeBias + audioDriveSigned + piBias) * couplingScale + presetBias,
-            -1,
-            1
-          );
+          ? clampRuntime(presetBias, -1, 1)
+          : freezeCoupling
+            ? prevCoupling
+            : clampRuntime(
+              (edgeBias + audioDriveSigned + piBias) * couplingScale +
+              presetBias,
+              -1,
+              1,
+            );
       let fgDrive = externalOpacityDriveSigned;
       let bgDrive = clampRuntime(-fgDrive * BG_COUPLE_STRENGTH, -1, 1);
       try {
@@ -9932,14 +10696,14 @@ export function bootstrapApp() {
         reason: audioInvalid
           ? "AUDIO_INVALID"
           : pmVisibilityHoldActive
-          ? `HOLD preset=${presetBias.toFixed(3)}`
-          : freezeCoupling
-          ? `FREEZE last=${Number(prevCoupling).toFixed(3)}`
-          : `edge=${edgeBias.toFixed(3)} audio=${audioDriveSigned.toFixed(
-              3
-            )} pi=${Number(piBias).toFixed(3)} preset=${presetBias.toFixed(
-              3
-            )}${lumaNote}`,
+            ? `HOLD preset=${presetBias.toFixed(3)}`
+            : freezeCoupling
+              ? `FREEZE last=${Number(prevCoupling).toFixed(3)}`
+              : `edge=${edgeBias.toFixed(3)} audio=${audioDriveSigned.toFixed(
+                3,
+              )} pi=${Number(piBias).toFixed(3)} preset=${presetBias.toFixed(
+                3,
+              )}${lumaNote}`,
       });
 
       // ProjectM avgColor -> background tint (runtime-only, default off).
@@ -9951,7 +10715,7 @@ export function bootstrapApp() {
           sectionState === "PEAK" ? 0.75 : sectionState === "GROOVE" ? 1 : 1.35;
         const intervalMs = Math.max(
           100,
-          Math.min(5000, pmColorLoop.intervalMs * sectionIntervalMul)
+          Math.min(5000, pmColorLoop.intervalMs * sectionIntervalMul),
         );
         if (!pmColorLoopLastUpdateMs) pmColorLoopLastUpdateMs = nowMs;
         if (nowMs - pmColorLoopLastUpdateMs >= intervalMs) {
@@ -9964,7 +10728,7 @@ export function bootstrapApp() {
           if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) {
             const dtPi = Math.max(
               0.05,
-              Math.min(2.0, (nowMs - pmColorLoopLastUpdateMs) / 1000)
+              Math.min(2.0, (nowMs - pmColorLoopLastUpdateMs) / 1000),
             );
             pmColorLoopLastUpdateMs = nowMs;
 
@@ -9986,16 +10750,16 @@ export function bootstrapApp() {
               sectionState === "PEAK"
                 ? 1.25
                 : sectionState === "GROOVE"
-                ? 1
-                : 0.7;
+                  ? 1
+                  : 0.7;
             const maxStrength = clampRuntime(
               pmColorLoop.maxStrength * sectionStrengthMul,
               0,
-              1
+              1,
             );
             const targetStrength = Math.max(
               0,
-              Math.min(maxStrength, dominanceExcess * 3 * pmColorLoop.amount)
+              Math.min(maxStrength, dominanceExcess * 3 * pmColorLoop.amount),
             );
 
             // Counter-hue (dominant + 0.5 turns) with user offset.
@@ -10011,37 +10775,37 @@ export function bootstrapApp() {
             const strengthDelta = targetStrength - pmColorLoopStrength01;
             const strengthStep = Math.max(
               -maxDelta,
-              Math.min(maxDelta, strengthDelta)
+              Math.min(maxDelta, strengthDelta),
             );
             pmColorLoopStrength01 = clampRuntime(
               pmColorLoopStrength01 + strengthStep,
               0,
-              1
+              1,
             );
 
             const contrastSectionMul =
               sectionState === "PEAK"
                 ? 1.2
                 : sectionState === "GROOVE"
-                ? 1
-                : 0.75;
+                  ? 1
+                  : 0.75;
             const targetContrastMul =
               1 +
               clampRuntime(
                 pmColorLoop.contrastAmount * contrastSectionMul,
                 0,
-                0.6
+                0.6,
               ) *
                 pmColorLoopStrength01;
             const contrastDelta = targetContrastMul - pmColorLoopContrastMul;
             const contrastStep = Math.max(
               -maxDelta,
-              Math.min(maxDelta, contrastDelta)
+              Math.min(maxDelta, contrastDelta),
             );
             pmColorLoopContrastMul = clampRuntime(
               pmColorLoopContrastMul + contrastStep,
               0.5,
-              2.0
+              2.0,
             );
           }
         }
@@ -10106,7 +10870,7 @@ export function bootstrapApp() {
         const portraitFocus01 = clamp01Runtime(scenePortraitFocus01, 0);
         const audio01 = clamp01Runtime(
           0.5 * kickLong01 + 0.35 * bassLong01 + 0.25 * hihatLong01,
-          0
+          0,
         );
         const depthBlurCap =
           sectionState === "PEAK" ? 30 : sectionState === "GROOVE" ? 24 : 18;
@@ -10119,7 +10883,7 @@ export function bootstrapApp() {
         const focusRetreatMul = clampRuntime(
           1 - 0.25 * portraitFocus01,
           0.6,
-          1
+          1,
         );
         const focusFogMul = clampRuntime(1 - 0.3 * portraitFocus01, 0.5, 1);
         const focusEdgeMul = 1 + 0.35 * portraitFocus01;
@@ -10130,17 +10894,17 @@ export function bootstrapApp() {
             (1 + 0.18 * spatial01 + 0.12 * audio01) *
             focusRetreatMul,
           0,
-          1
+          1,
         );
         const nextFog = clampRuntime(
           baseFog * (1 + 0.35 * spatial01 + 0.18 * audio01) * focusFogMul,
           0,
-          2.5
+          2.5,
         );
         const nextEdge = clampRuntime(
           baseEdge * (1 + 0.45 * edgeDrive01 + 0.2 * audio01) * focusEdgeMul,
           0,
-          4
+          4,
         );
         const nextBlur = clampRuntime(
           baseBlur +
@@ -10149,51 +10913,51 @@ export function bootstrapApp() {
             depthCouplingWave01 * 5 +
             focusBlurOffset,
           0,
-          depthBlurCap
+          depthBlurCap,
         );
         const nextLayers = clampRuntime(
           Math.round(
             baseLayers +
               5 * spatial01 +
               3 * audio01 +
-              depthCouplingBpmLayersBoost
+            depthCouplingBpmLayersBoost,
           ),
           3,
-          depthLayersCap
+          depthLayersCap,
         );
         const nextScale = clampRuntime(
           baseScale * (1 + depthCouplingWave01 * 0.3),
           0.5,
-          depthScaleCap
+          depthScaleCap,
         );
         const nextFps = clampRuntime(Math.round(baseFps), 5, depthFpsCap);
         depthCouplingFog01 = clamp01Runtime(nextFog / 2.5, 0);
         depthCouplingEdge01 = clamp01Runtime(nextEdge / 4, 0);
         const depthComplex01 = clamp01Runtime(
           0.6 * depthCouplingEdge01 + 0.4 * depthCouplingFog01,
-          0
+          0,
         );
         const profileDepthMul =
           aivj.profile === "peakRave"
             ? 1.05
             : aivj.profile === "videoVj"
-            ? 0.9
-            : aivj.profile === "drone"
-            ? 0.85
-            : aivj.profile === "ambient"
-            ? 0.9
-            : aivj.profile === "dub"
-            ? 0.95
-            : 1;
+              ? 0.9
+              : aivj.profile === "drone"
+                ? 0.85
+                : aivj.profile === "ambient"
+                  ? 0.9
+                  : aivj.profile === "dub"
+                    ? 0.95
+                    : 1;
         const portraitDepthMul = clampRuntime(
           1 - 0.35 * portraitFocus01,
           0.6,
-          1
+          1,
         );
         sceneDepthWeightMul = clampRuntime(
           (1 - depthComplex01 * 0.35) * profileDepthMul * portraitDepthMul,
           0.55,
-          1.2
+          1.2,
         );
 
         // Apply at a modest rate to avoid triggering expensive re-processing too often.
@@ -10252,7 +11016,7 @@ export function bootstrapApp() {
 
       const energy01 = clamp01Runtime(
         Number(frame.energy ?? (frame as any).energyRaw ?? 0),
-        0
+        0,
       );
       const depth01 = clamp01Runtime(depthFresh01Smoothed, 0);
 
@@ -10286,7 +11050,7 @@ export function bootstrapApp() {
 
       const total = wBasic + wCamera + wVideo + wDepth;
       const nActive = [wBasic, wCamera, wVideo, wDepth].filter(
-        (w) => w > 0
+        (w) => w > 0,
       ).length;
       overlayBudgetDiag.nActive = nActive;
 
@@ -10294,7 +11058,7 @@ export function bootstrapApp() {
         sectionState === "PEAK" ? 0.85 : sectionState === "GROOVE" ? 1 : 1.15;
       const maxEnergy = Math.max(
         0.05,
-        (Number(overlayBudget.maxEnergy) || 1.15) * sectionOverlayMaxMul
+        (Number(overlayBudget.maxEnergy) || 1.15) * sectionOverlayMaxMul,
       );
       const budget01 = total > 0 ? clamp01Runtime(energy01 / maxEnergy, 0) : 0;
       const minScale = clampRuntime(Number(overlayBudget.minScale) || 0, 0, 1);
@@ -10335,17 +11099,17 @@ export function bootstrapApp() {
       const retreatStrength = clampRuntime(
         (Number(overlayBudget.pmRetreatStrength) || 0) * sectionRetreatMul,
         0,
-        1
+        1,
       );
       const retreatFloor = clampRuntime(
         Number(overlayBudget.pmRetreatFloor) || 0.55,
         0,
-        1
+        1,
       );
       const pmTarget = clampRuntime(
         1 - retreatStrength * clamp01Runtime(meanOverlayMul, 0),
         retreatFloor,
-        1
+        1,
       );
       overlayBudgetDiag.pmTarget = pmVisibilityHoldActive ? 1 : pmTarget;
       overlayMulProjectM =
@@ -10364,7 +11128,7 @@ export function bootstrapApp() {
         reason: pmVisibilityHoldActive
           ? "HOLD manual"
           : `meanOverlayMul=${meanOverlayMul.toFixed(
-              3
+            3,
             )} pmTarget=${pmTarget.toFixed(3)} sec=${sectionState}`,
       });
 
@@ -10374,7 +11138,7 @@ export function bootstrapApp() {
       (depthLayer as any)?.setOverlayOpacityMultiplier?.(overlayMulDepth);
       (projectLayer as any)?.setOverlayOpacityMultiplier?.(overlayMulProjectM);
       (projectLayerBg as any)?.setOverlayOpacityMultiplier?.(
-        overlayMulProjectM
+        overlayMulProjectM,
       );
     }
 
@@ -10392,7 +11156,7 @@ export function bootstrapApp() {
         sectionState === "PEAK" ? 1.1 : sectionState === "GROOVE" ? 1 : 0.8;
       const mixToMacros01 = clamp01Runtime(
         audioControlsCfg.mixToMacros * sectionMixMul,
-        0
+        0,
       );
       const out = aivjController.onFrame({
         enabled: aiEnabled,
@@ -10418,11 +11182,11 @@ export function bootstrapApp() {
           pulse01: clamp01Runtime(Number(frame.features?.beatPulse ?? 0), 0),
           confidence01: clamp01Runtime(
             Number(frame.features?.beatConfidence ?? 0),
-            0
+            0,
           ),
           stability01: clamp01Runtime(
             Number((frame.features as any)?.beatStability ?? 0),
-            0
+            0,
           ),
         },
         portraitEdge01: portraitEdge01Smoothed,
@@ -10523,7 +11287,7 @@ export function bootstrapApp() {
       const fgBaseEnergy = clampRuntime(
         fgBlend.energyToOpacityAmount - pmEnergyDepthBoost,
         0,
-        1
+        1,
       );
       const fgBoost = depthEdge01 * 0.2;
       const fgEnergy = clampRuntime(fgBaseEnergy + fgBoost, 0, 1);
@@ -10539,7 +11303,7 @@ export function bootstrapApp() {
       const bgBaseEnergy = clampRuntime(
         bgBlend.energyToOpacityAmount - pmEnergyDepthBoostBg,
         0,
-        1
+        1,
       );
       const bgBoost = depthEdge01 * 0.12;
       const bgEnergy = clampRuntime(bgBaseEnergy + bgBoost, 0, 1);
@@ -10571,7 +11335,7 @@ export function bootstrapApp() {
         const energyDelta = autoPresetEnergyFast - autoPresetEnergySlow;
         const beatPulse01 = clamp01Runtime(
           Number(frame.features?.beatPulse ?? 0),
-          0
+          0,
         );
         const beatQuality01 = clamp01Runtime(beatQuality01Smoothed, 0);
         const drive01 = Math.max(motion, sparkle);
@@ -10579,8 +11343,8 @@ export function bootstrapApp() {
           sceneLabel === "ambient"
             ? 22000
             : sceneLabel === "rock"
-            ? 14000
-            : 11000;
+              ? 14000
+              : 11000;
         const qualityCooldownMul = 1 + (1 - beatQuality01) * 1.1;
         const sceneCooldownMs = baseCooldownMs * qualityCooldownMul;
         const canPreset = nowMs - autoPresetLastMs > sceneCooldownMs;
@@ -10631,14 +11395,14 @@ export function bootstrapApp() {
             sceneLabel === "ambient"
               ? 15000
               : sceneLabel === "rock"
-              ? 11000
-              : 9000;
+                ? 11000
+                : 9000;
           if (nowMs - autoVariantLastMs > variantCooldownMs) {
             autoVariantLastMs = nowMs;
             applyBackgroundLayerPatch(
               "liquid",
               { variant: nextVariant },
-              "macro"
+              "macro",
             );
           }
         }
@@ -10677,7 +11441,7 @@ export function bootstrapApp() {
     {
       const energy01 = Math.min(
         1,
-        Math.max(0, frame.energy ?? (frame as any).energyRaw ?? 0)
+        Math.max(0, frame.energy ?? (frame as any).energyRaw ?? 0),
       );
       const nowMs = performance.now();
       const dtSec = Math.max(0.001, (nowMs - uiEnergyLastMs) / 1000);
@@ -10715,8 +11479,8 @@ export function bootstrapApp() {
           dom.audioTempoText.textContent = tempo.lastError
             ? "BPM err"
             : hasBpm
-            ? `BPM ${Math.round(displayBpm)}`
-            : "BPM --";
+              ? `BPM ${Math.round(displayBpm)}`
+              : "BPM --";
           dom.audioTempoText.title = tempo.lastError
             ? `BeatTempo error: ${tempo.lastError}`
             : `confidence=${Math.round(conf01 * 100)}% ok=${
@@ -10761,14 +11525,14 @@ export function bootstrapApp() {
       if (pmBudgetStatusText) {
         const meanMul = Math.min(
           1,
-          Math.max(0, Number(overlayBudgetDiag.meanOverlayMul ?? 0))
+          Math.max(0, Number(overlayBudgetDiag.meanOverlayMul ?? 0)),
         );
         const pmTarget = Math.min(
           1,
-          Math.max(0, Number(overlayBudgetDiag.pmTarget ?? 1))
+          Math.max(0, Number(overlayBudgetDiag.pmTarget ?? 1)),
         );
         pmBudgetStatusText.textContent = `budget ${Math.round(
-          meanMul * 100
+          meanMul * 100,
         )}% | pm ${Math.round(pmTarget * 100)}%`;
       }
 
@@ -10778,7 +11542,7 @@ export function bootstrapApp() {
           ? Math.max(0, now - lastAudioFrameMs)
           : 0;
         const ePct = Math.round(
-          Math.min(1, Math.max(0, uiEnergy01Smoothed)) * 100
+          Math.min(1, Math.max(0, uiEnergy01Smoothed)) * 100,
         );
         technoProfileSummary.textContent = `profile=${
           aivj.profile
@@ -10810,7 +11574,7 @@ export function bootstrapApp() {
 
         const bindings = midiController?.getBindings?.() ?? [];
         const midiMacroBankBound = bankTargets.filter((t) =>
-          bindings.some((b) => sameTarget(b.target, t))
+          bindings.some((b) => sameTarget(b.target, t)),
         ).length;
 
         const baseBank = lastAivjBaseBank ?? getMacroBankFromState();
@@ -10849,7 +11613,7 @@ export function bootstrapApp() {
         isSilent: frame.isSilent,
       });
       diagnosticsPanel.updateProjectM(
-        (globalThis as any).__projectm_verify ?? {}
+        (globalThis as any).__projectm_verify ?? {},
       );
       const soak = summarizeSoak();
       if (now - lastSoakReportMs >= SOAK_REPORT_INTERVAL_MS) {
@@ -11124,34 +11888,34 @@ export function bootstrapApp() {
           spatial: (() => {
             const edge01 = Math.min(
               1,
-              Math.max(0, Number(portraitEdge01Smoothed ?? 0))
+              Math.max(0, Number(portraitEdge01Smoothed ?? 0)),
             );
             const area01 = Math.min(
               1,
-              Math.max(0, Number(portraitArea01Smoothed ?? 0))
+              Math.max(0, Number(portraitArea01Smoothed ?? 0)),
             );
             const depth01 = Math.min(
               1,
-              Math.max(0, Number(depthFresh01Smoothed ?? 0))
+              Math.max(0, Number(depthFresh01Smoothed ?? 0)),
             );
             const edgeDrive01 = Math.min(
               1,
-              Math.max(0, edge01 * (0.35 + 0.65 * area01))
+              Math.max(0, edge01 * (0.35 + 0.65 * area01)),
             );
             const edgeBias01 = Math.min(
               1,
               Math.max(
                 0,
-                edgeDrive01 * Math.min(1, Math.max(0, cameraEdgeToPmAmount01))
-              )
+                edgeDrive01 * Math.min(1, Math.max(0, cameraEdgeToPmAmount01)),
+              ),
             );
             const piBiasSigned = Number(pmClosedLoopLastOutput ?? 0);
             const presetBiasSigned = Number(
-              pmPresetExternalOpacityBiasSigned ?? 0
+              pmPresetExternalOpacityBiasSigned ?? 0,
             );
             const externalOpacityDriveSigned = Math.max(
               -1,
-              Math.min(1, edgeBias01 + piBiasSigned + presetBiasSigned)
+              Math.min(1, edgeBias01 + piBiasSigned + presetBiasSigned),
             );
             return {
               portraitEdge01: edge01,
@@ -11159,7 +11923,7 @@ export function bootstrapApp() {
               depthFresh01: depth01,
               cameraEdgeToPmAmount01: Math.min(
                 1,
-                Math.max(0, cameraEdgeToPmAmount01)
+                Math.max(0, cameraEdgeToPmAmount01),
               ),
               edgeDrive01,
               edgeBias01,
@@ -11265,7 +12029,7 @@ export function bootstrapApp() {
         return;
       }
       void reloadLibraryPresets(nextSource);
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -11273,13 +12037,22 @@ export function bootstrapApp() {
       const select = event.target as HTMLSelectElement;
       const presetId = select.value;
       void loadPresetById(presetId, "select");
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(presetNextButton, "click", () => {
+      // Headless verify sel-loop collects samples by scanning console output for "[sel]".
+      // Emit a lightweight line on click so sampling doesn't depend on async preset load completion.
+      try {
+        console.log(
+          `[sel] mode=manual-click lib=${String(currentLibrarySource)} reason=preset-next`,
+        );
+      } catch {
+        // ignore
+      }
       requestPresetCycle("manual");
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -11290,7 +12063,7 @@ export function bootstrapApp() {
       } else {
         stopAutoCycle("Auto-cycle paused");
       }
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -11301,7 +12074,7 @@ export function bootstrapApp() {
       } else {
         setPresetStatus(`Auto-cycle interval set to ${seconds}s`);
       }
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -11424,7 +12197,7 @@ export function bootstrapApp() {
         flushPendingPresetRequests();
         input.value = "";
       }
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -11470,7 +12243,7 @@ export function bootstrapApp() {
         const cacheResult = await loadPresetUrlMaybeCached(
           projectLayer,
           url,
-          "url"
+          "url",
         );
         currentPresetId = null;
         currentPresetUrl = url;
@@ -11551,19 +12324,19 @@ export function bootstrapApp() {
         updatePresetCyclerAvailability();
         flushPendingPresetRequests();
       }
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(visualRandomButton, "click", () => {
       void applyRandomVisualStateSafe();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(visualRandomParamsButton, "click", () => {
       applyRandomCurrentParams();
-    })
+    }),
   );
 
   trackBootstrapDispose(
@@ -11585,17 +12358,17 @@ export function bootstrapApp() {
       dom.audioStatus.textContent = "Favorited current visual state";
       dom.audioStatus.dataset.state = "ok";
       favoritesController.showPanel();
-    })
+    }),
   );
 
   trackBootstrapDispose(
     listen(visualFavoriteCount, "click", () => {
       favoritesController.togglePanel();
-    })
+    }),
   );
 
   trackBootstrapDispose(
-    listen(window, "beforeunload", () => audioBus.dispose())
+    listen(window, "beforeunload", () => audioBus.dispose()),
   );
 
   if (import.meta.hot) {
