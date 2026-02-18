@@ -110,11 +110,23 @@ if ($GpuMode -ne "off" -and -not $Headed) {
   Write-Host "[eval] WARNING: headless Chromium on Windows often falls back to SwiftShader (CPU). Use -Headed for real RTX GPU rendering."
 }
 
-# v4 hardened defaults: use filtered manifest + quality thresholds
-$env:COUPLED_SMOKE_PAIRS_MANIFEST = "pairs-manifest.filtered.current.json"
-$env:COUPLED_SMOKE_MOTION_MIN     = "0.00001"
-$env:COUPLED_SMOKE_LUMA_MIN       = "0.06"
-Write-Host "[eval] v4 env: manifest=$($env:COUPLED_SMOKE_PAIRS_MANIFEST) motionMin=$($env:COUPLED_SMOKE_MOTION_MIN) lumaMin=$($env:COUPLED_SMOKE_LUMA_MIN)"
+# v4 hardened defaults: only inject when running the single coupled-final pack
+# and the caller hasn't already set overrides via env
+$isCoupledFinalOnly = ($packsList.Count -eq 1 -and $packsList[0] -eq "ai_generated_coupled_final")
+if ($isCoupledFinalOnly) {
+  if (-not $env:COUPLED_SMOKE_PAIRS_MANIFEST) {
+    $env:COUPLED_SMOKE_PAIRS_MANIFEST = "pairs-manifest.filtered.current.json"
+  }
+  if (-not $env:COUPLED_SMOKE_MOTION_MIN) {
+    $env:COUPLED_SMOKE_MOTION_MIN = "0.00001"
+  }
+  if (-not $env:COUPLED_SMOKE_LUMA_MIN) {
+    $env:COUPLED_SMOKE_LUMA_MIN = "0.06"
+  }
+  Write-Host "[eval] v4 env: manifest=$($env:COUPLED_SMOKE_PAIRS_MANIFEST) motionMin=$($env:COUPLED_SMOKE_MOTION_MIN) lumaMin=$($env:COUPLED_SMOKE_LUMA_MIN)"
+} else {
+  Write-Host "[eval] multi-pack or non-coupled-final → skipping v4 env injection (packs=$($packsList -join ','))"
+}
 
 Push-Location $projectRoot
 try {
