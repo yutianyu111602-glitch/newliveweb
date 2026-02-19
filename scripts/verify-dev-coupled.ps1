@@ -13,9 +13,12 @@ param(
   [int]$TargetSamples = 5,
   [double]$MaxHours = 0.15,
   [string]$AudioMode = "click",
+  [string]$AudioRoot = "",
   [string]$PairsManifest = "",
   [double]$MotionMin = 0,
   [double]$LumaMin = 0,
+  [int]$GotoTimeoutMs = 30000,
+  [int]$ViteReadyTimeoutMs = 90000,
   [switch]$Headed = $false
 )
 
@@ -80,6 +83,8 @@ try {
     "--viewportHeight", "540",
     "--deviceScaleFactor", "1",
     "--gpuMode", "safe",
+    "--gotoTimeoutMs", "$GotoTimeoutMs",
+    "--viteReadyTimeoutMs", "$ViteReadyTimeoutMs",
     "--outDir", $OutDir
   )
   if ($Headed) {
@@ -94,6 +99,9 @@ try {
   }
   if ($LumaMin -gt 0) {
     $nodeArgs += @("--lumaMin", "$LumaMin")
+  }
+  if ($AudioRoot) {
+    $nodeArgs += @("--audioRoot", $AudioRoot)
   }
 
   & node @nodeArgs
@@ -126,6 +134,27 @@ try {
     Write-Host "  samples=$samples/$target elapsed=${elapsed}s navTimeout=$navTimeout (${navMs}ms) restarts=$restarts (${restartMs}ms)"
     Write-Host "  budget: input=$inputH effective=$effectiveH clamped=$clamped"
     Write-Host "  done=$done"
+
+    # Show error code if present (P0 diagnostics)
+    if ($meta.error -and $meta.error.code) {
+      Write-Host "  ERROR code=$($meta.error.code) message=$($meta.error.message)" -ForegroundColor Red
+    }
+  }
+
+  # Evidence pack: copy key files to a timestamped archive under artifacts/_release_*
+  $ts2 = Get-Date -Format "yyyyMMdd_HHmmss"
+  $archiveDir = Join-Path $rootDir "artifacts/_release_$ts2"
+  try {
+    New-Item -ItemType Directory -Path $archiveDir -Force | Out-Null
+    foreach ($f in @("meta.json", "vite.log", "eval.jsonl")) {
+      $src = Join-Path $OutDir $f
+      if (Test-Path $src) {
+        Copy-Item $src (Join-Path $archiveDir $f) -Force
+      }
+    }
+    Write-Host "[verify:dev coupled] evidence pack: $archiveDir"
+  } catch {
+    Write-Host "[verify:dev coupled] WARNING: evidence pack failed: $($_.Exception.Message)" -ForegroundColor Yellow
   }
 
   if ($code -ne 0) {

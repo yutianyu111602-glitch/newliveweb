@@ -104,6 +104,20 @@ const shortUrlLabel = (url) => {
   return last || normalized || s;
 };
 
+// --- Structured error codes for meta.error.code ---
+const classifyErrorCode = (error) => {
+  const msg = String(error?.message || error || '');
+  if (msg.includes('FATAL_WEBGL_SWIFTSHADER')) return 'FATAL_WEBGL_SWIFTSHADER';
+  if (msg.includes('MANIFEST_MISMATCH')) return 'FATAL_MANIFEST_MISMATCH';
+  if (msg.includes('Timed out waiting for dev server') || msg.includes('Dev server not reachable')) return 'FATAL_VITE_NOT_READY';
+  if (msg.includes('browserMaxRestarts exceeded')) return 'FATAL_BROWSER_RESTART_LIMIT';
+  if (msg.includes('no-samples-collected')) return 'FATAL_NO_SAMPLES';
+  if (/browser has been closed|Target closed|Target page.*closed/i.test(msg)) return 'FATAL_PLAYWRIGHT_CRASH';
+  if (/audio.*not usable|requireAudio/i.test(msg)) return 'FATAL_AUDIO';
+  if (/no free port/i.test(msg)) return 'FATAL_NO_FREE_PORT';
+  return 'UNKNOWN';
+};
+
 async function pickFirstAudioFileInDir(dirPath) {
   let dir = null;
   try {
@@ -761,10 +775,14 @@ async function main() {
     );
     console.log('Stuck flags: --pickTimeoutMs 10000 --stuckMaxConsecutive 3 --stuckMaxRestarts 6 --browserMaxRestarts 20');
     console.log(
+      'Timeout flags: --gotoTimeoutMs 30000 --viteReadyTimeoutMs 90000 (navigation + dev server ready timeouts)'
+    );
+    console.log(
       'Heuristic flags: --motionMin 0.000015 --lumaMin 0.06 (override okHeuristic thresholds for low-motion / too-dark)'
     );
     console.log('Manifest flags: --pairsManifest pairs-manifest.v0.json (filename inside public/presets/<pack>/, default: pairs-manifest.v0.json)');
     console.log('Vite flags: --noSpawnVite, --vitePort auto|<port> (default: auto), --headed');
+    console.log('GPU flags: --requireGpu (fail-fast if SwiftShader detected; implied when --headed + gpuMode!=off)');
     console.log('Resume flags: --resume (continue in existing outDir by reading eval.jsonl/meta.json)');
     process.exitCode = 0;
     return;
@@ -837,6 +855,9 @@ async function main() {
   const resume = resolveBool(parsed, 'resume', false);
   const gpuModeRaw = String(resolveArg(parsed, 'gpuMode', 'safe')).trim().toLowerCase();
   const gpuMode = ['off', 'safe', 'force-d3d11'].includes(gpuModeRaw) ? gpuModeRaw : 'safe';
+  const requireGpuExplicit = resolveBool(parsed, 'requireGpu', undefined);
+  // Imply --requireGpu when headed + GPU enabled (most common real-hardware path)
+  const requireGpu = requireGpuExplicit != null ? requireGpuExplicit : (headed && gpuMode !== 'off');
   const muteAudio = resolveBool(parsed, 'muteAudio', true);
   const startMaximized = resolveBool(parsed, 'startMaximized', false);
 
@@ -860,6 +881,12 @@ async function main() {
 
   const browserMaxRestartsRaw = Number(resolveArg(parsed, 'browserMaxRestarts', '20'));
   const browserMaxRestarts = Number.isFinite(browserMaxRestartsRaw) ? clampInt(browserMaxRestartsRaw, 0, 200) : 20;
+
+  // P0: Configurable timeouts for diagnosability (Step 2)
+  const gotoTimeoutMsRaw = Number(resolveArg(parsed, 'gotoTimeoutMs', '30000'));
+  const gotoTimeoutMs = Number.isFinite(gotoTimeoutMsRaw) ? clampInt(gotoTimeoutMsRaw, 1000, 300_000) : 30_000;
+  const viteReadyTimeoutMsRaw = Number(resolveArg(parsed, 'viteReadyTimeoutMs', '90000'));
+  const viteReadyTimeoutMs = Number.isFinite(viteReadyTimeoutMsRaw) ? clampInt(viteReadyTimeoutMsRaw, 5000, 600_000) : 90_000;
 
   // P5.1: Configurable heuristic thresholds (data-driven defaults from sweep P90/P50 analysis)
   // Old hardcoded: 0.002 motion, 0.06 luma.  Sweep showed P50(motion)=1.14e-5, P95=2.55e-3.
@@ -952,6 +979,8 @@ async function main() {
       targetUniquePairs: Math.ceil(p.pairCount * targetCoverage),
     })),
     limits: { maxHours, reloadEvery },
+    // P0: Configurable timeouts for meta evidence
+    timeouts: { gotoMs: gotoTimeoutMs, viteReadyMs: viteReadyTimeoutMs },
     // P1.2A: 运行时计时统计
     timing: { ...timingStats },
     sample: { downsampleSize, intervalMs, warmupSamples, measureSamples },
@@ -1043,6 +1072,8 @@ async function main() {
     });
   };
 
+  let startMs = Date.now();
+
   try {
     // Prefer reusing an existing Vite.
     try {
@@ -1063,7 +1094,7 @@ async function main() {
       });
       vite.stdout.on('data', (c) => viteLog.write(c));
       vite.stderr.on('data', (c) => viteLog.write(c));
-      await waitForHttpOk(baseUrl, 60_000);
+      await waitForHttpOk(baseUrl, viteReadyTimeoutMs);
     }
 
     ws = fs.createWriteStream(evalPath, { flags: 'a' });
@@ -1305,7 +1336,8 @@ async function main() {
     };
     attachPageDiagnostics();
 
-    const startMs = Date.now();
+    // Reset startMs to after browser launch so timing excludes vite+browser setup
+    startMs = Date.now();
     const deadlineMs = startMs + maxMs;
 
     const setOverlay = async (text) => {
@@ -1431,25 +1463,25 @@ async function main() {
       const bootstrapPack = async (phase) => {
         viteLog.write(`[eval] pack=${pack} bootstrap phase=${String(phase || '')}\n`);
 
-        const gotoWithRetries = async () => {
+        const gotoWithRetries = async (targetUrl) => {
           const attempts = 4;
           let lastErr = null;
           for (let i = 1; i <= attempts; i++) {
             try {
-              viteLog.write(`[eval] pack=${pack} goto:try${i}/${attempts}\n`);
+              viteLog.write(`[eval] pack=${pack} goto:try${i}/${attempts} url=${targetUrl}\n`);
               // Prefer commit (fast). Some Windows/headless runs can stall here even though
               // the page later starts executing; don't treat a timeout as fatal.
-              await page.goto(url, { waitUntil: 'commit', timeout: 20_000 });
+              await page.goto(targetUrl, { waitUntil: 'commit', timeout: gotoTimeoutMs });
               viteLog.write(`[eval] pack=${pack} goto:ok\n`);
               return true;
             } catch (err) {
               lastErr = err;
               const msg = String(err?.message || err || 'goto error');
-              viteLog.write(`[eval] pack=${pack} goto:warn${i} ${msg}\n`);
+              viteLog.write(`[eval] pack=${pack} goto:warn${i} timeout=${gotoTimeoutMs}ms ${msg}\n`);
               // P1.2A: 记录导航超时计数
               if (msg.toLowerCase().includes('timeout')) {
                 timingStats.navTimeoutCount += 1;
-                timingStats.navTotalMs += 20_000;
+                timingStats.navTotalMs += gotoTimeoutMs;
               }
               // If this looks like a transient navigation error, backoff and retry.
               await new Promise((r) => setTimeout(r, 600));
@@ -1463,8 +1495,27 @@ async function main() {
           return false;
         };
 
-        viteLog.write(`[eval] pack=${pack} goto:start\n`);
-        await gotoWithRetries();
+        viteLog.write(`[eval] pack=${pack} goto:start host=${host}\n`);
+        let gotoOk = await gotoWithRetries(url);
+
+        // Step 3: Host fallback — if goto failed with primary host, try alternate
+        if (!gotoOk) {
+          const altHost = host === '127.0.0.1' ? 'localhost' : host === 'localhost' ? '127.0.0.1' : null;
+          if (altHost) {
+            const altUrl = url.replace(`//${host}:`, `//${altHost}:`);
+            viteLog.write(`[eval] pack=${pack} goto:host-fallback trying ${altHost}\n`);
+            timingStats.hostFallbackAttempted = true;
+            gotoOk = await gotoWithRetries(altUrl);
+            if (gotoOk) {
+              viteLog.write(`[eval] pack=${pack} goto:host-fallback succeeded with ${altHost}\n`);
+              timingStats.hostFallbackSucceeded = true;
+              timingStats.effectiveHost = altHost;
+            } else {
+              viteLog.write(`[eval] pack=${pack} goto:host-fallback also failed with ${altHost}\n`);
+              timingStats.hostFallbackSucceeded = false;
+            }
+          }
+        }
 
         // Treat core DOM attachment as the real readiness signal.
         // If navigation is still "in flight", Playwright can block selector waits;
@@ -1625,6 +1676,7 @@ async function main() {
             meta.runtime = meta.runtime || {};
             meta.runtime.gpuMode = gpuMode;
             meta.runtime.headed = headed;
+            meta.runtime.requireGpu = requireGpu;
             meta.runtime.webgl = glInfo;
             await fsp.writeFile(metaPath, `${JSON.stringify({ ...meta, finishedAt: null }, null, 2)}\n`, 'utf8');
           } catch {
@@ -1632,13 +1684,22 @@ async function main() {
           }
 
           const renderer = String(glInfo?.renderer || '');
-          if (gpuMode !== 'off' && renderer && renderer.toLowerCase().includes('swiftshader')) {
-            viteLog.write(
-              `[eval] WARNING: WebGL renderer is SwiftShader (software). On Windows, use --headed to actually use the RTX GPU.\n`
-            );
+          const isSwiftShader = renderer && renderer.toLowerCase().includes('swiftshader');
+          if (gpuMode !== 'off' && isSwiftShader) {
+            const msg = `FATAL_WEBGL_SWIFTSHADER: renderer="${renderer}". On Windows, use --headed to actually use the RTX GPU.`;
+            viteLog.write(`[eval] ${msg}\n`);
+            if (requireGpu) {
+              try {
+                meta.runtime = meta.runtime || {};
+                meta.error = { code: 'FATAL_WEBGL_SWIFTSHADER', renderer, message: msg };
+                await fsp.writeFile(metaPath, `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
+              } catch { /* ignore */ }
+              throw new Error(msg);
+            }
           }
-        } catch {
-          // ignore
+        } catch (glErr) {
+          // SwiftShader fail-fast errors must propagate; swallow only non-fatal WebGL probe errors
+          if (glErr?.message?.includes('FATAL_WEBGL_SWIFTSHADER')) throw glErr;
         }
 
         // Coupled should be enabled for this pack before we start sampling, but on some runs
@@ -2433,8 +2494,20 @@ async function main() {
       // ignore
     }
     try {
+      const code = classifyErrorCode(error);
+      const lastUrl = (() => {
+        try { return page?.url?.() || null; } catch { return null; }
+      })();
       meta.finishedAt = new Date().toISOString();
-      meta.error = { pack, iter, message: String(error?.message || error || '') };
+      meta.timing = { ...timingStats, elapsedSec: (Date.now() - startMs) / 1000 };
+      meta.error = {
+        code,
+        pack,
+        iter,
+        message: String(error?.message || error || '').slice(0, 4000),
+        stack: String(error?.stack || '').slice(0, 4000),
+        lastUrl,
+      };
       await fsp.writeFile(metaPath, `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
     } catch {
       // ignore
