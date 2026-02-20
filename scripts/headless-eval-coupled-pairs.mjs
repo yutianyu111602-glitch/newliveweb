@@ -1157,6 +1157,8 @@ async function main() {
         }
     );
     page = await context.newPage();
+    page.setDefaultNavigationTimeout(gotoTimeoutMs);
+    page.setDefaultTimeout(gotoTimeoutMs);
 
     // Ensure verify-mode behavior is enabled early enough for bootstrap.
     const initVerifyScript = ({ presetLibrarySource, runManifestUrl }) => {
@@ -1295,6 +1297,15 @@ async function main() {
     let consoleErrorCount = 0;
     let pageCrashCount = 0;
     let pageCloseCount = 0;
+    // Circular buffer of recent page events for failure evidence
+    const pageEventsBuffer = [];
+    const PAGE_EVENTS_MAX = 200;
+    const pushPageEvent = (type, text) => {
+      pageEventsBuffer.push({ ts: new Date().toISOString(), type, text: String(text || '').slice(0, 600) });
+      if (pageEventsBuffer.length > PAGE_EVENTS_MAX) pageEventsBuffer.shift();
+    };
+    // Current lifecycle phase for meta.error diagnostics
+    let currentPhase = 'init';
     const attachPageDiagnostics = () => {
       try {
         page.on('pageerror', (err) => {
@@ -1302,6 +1313,7 @@ async function main() {
           try {
             const msg = String(err?.message || err || '').replace(/\r?\n/g, ' | ').slice(0, 600);
             viteLog.write(`[pageerror] ${msg}\n`);
+            pushPageEvent('pageerror', msg);
           } catch {
             // ignore
           }
@@ -1310,7 +1322,17 @@ async function main() {
           if (msg.type() !== 'error') return;
           consoleErrorCount += 1;
           try {
-            viteLog.write(`[console.error] ${String(msg.text() || '').replace(/\r?\n/g, ' | ').slice(0, 600)}\n`);
+            const text = String(msg.text() || '').replace(/\r?\n/g, ' | ').slice(0, 600);
+            viteLog.write(`[console.error] ${text}\n`);
+            pushPageEvent('console.error', text);
+          } catch {
+            // ignore
+          }
+        });
+        page.on('requestfailed', (req) => {
+          try {
+            const text = `${req.url()} ${req.failure()?.errorText || ''}`;
+            pushPageEvent('requestfailed', text);
           } catch {
             // ignore
           }
@@ -1402,6 +1424,8 @@ async function main() {
           }
       );
       page = await context.newPage();
+      page.setDefaultNavigationTimeout(gotoTimeoutMs);
+      page.setDefaultTimeout(gotoTimeoutMs);
       await page.addInitScript(initVerifyScript, { presetLibrarySource, runManifestUrl });
       attachPageDiagnostics();
       // P1.2A: 记录重启耗时
@@ -1462,10 +1486,12 @@ async function main() {
       })();
 
       const bootstrapPack = async (phase) => {
+        currentPhase = `bootstrap:${String(phase || 'init')}`;
         viteLog.write(`[eval] pack=${pack} bootstrap phase=${String(phase || '')}\n`);
 
         // HTTP preflight: verify Vite actually responds before wasting 60s on page.goto
         const httpPreflight = async (targetUrl) => {
+          currentPhase = `preflight:${String(phase || 'init')}`;
           const preflightStart = Date.now();
           try {
             const baseOnly = new URL(targetUrl).origin + '/';
@@ -1487,6 +1513,7 @@ async function main() {
         };
 
         const gotoWithRetries = async (targetUrl) => {
+          currentPhase = `goto:${String(phase || 'init')}`;
           // Run HTTP preflight before 1st attempt to detect Vite-down vs Playwright-navigation issues
           const pf = await httpPreflight(targetUrl);
           if (!pf.ok) {
@@ -1513,6 +1540,12 @@ async function main() {
                 timingStats.navTimeoutCount += 1;
                 timingStats.navTotalMs += gotoTimeoutMs;
               }
+              // Screenshot on failure for evidence
+              try {
+                const screenshotPath = path.join(outDir, `nav_fail_try${i}.png`);
+                await page.screenshot({ path: screenshotPath, fullPage: false }).catch(() => {});
+                viteLog.write(`[eval] pack=${pack} goto:screenshot saved ${screenshotPath}\n`);
+              } catch { /* ignore */ }
               // If this looks like a transient navigation error, backoff and retry.
               await new Promise((r) => setTimeout(r, 600));
             }
@@ -1521,10 +1554,18 @@ async function main() {
           // We proceed to selector-based readiness checks below; they'll throw if truly dead.
           if (lastErr) {
             viteLog.write(`[eval] pack=${pack} goto:failed (continuing to selector checks) ${String(lastErr)}\n`);
+            // Dump page events buffer for post-mortem
+            try {
+              const eventsPath = path.join(outDir, `playwright-events-${pack}.log`);
+              const eventsText = pageEventsBuffer.map((e) => `${e.ts} [${e.type}] ${e.text}`).join('\n');
+              await fsp.writeFile(eventsPath, eventsText + '\n', 'utf8');
+              viteLog.write(`[eval] pack=${pack} events log dumped: ${eventsPath} (${pageEventsBuffer.length} events)\n`);
+            } catch { /* ignore */ }
           }
           return false;
         };
 
+        currentPhase = `goto:${String(phase || 'init')}`;
         viteLog.write(`[eval] pack=${pack} goto:start host=${host}\n`);
         let gotoOk = await gotoWithRetries(url);
 
@@ -1550,6 +1591,7 @@ async function main() {
         // Treat core DOM attachment as the real readiness signal.
         // If navigation is still "in flight", Playwright can block selector waits;
         // tolerate that by using a longer timeout here.
+        currentPhase = `dom_ready:${String(phase || 'init')}`;
         await page.waitForSelector('#viz-canvas', { state: 'attached', timeout: 90_000 });
         await page.waitForSelector('#preset-next', { state: 'attached', timeout: 90_000 });
         viteLog.write(`[eval] pack=${pack} preset-next:attached\n`);
@@ -1644,6 +1686,7 @@ async function main() {
         }
 
         // Audio drive (speaker output muted via Chromium flag when enabled; analysis must be non-zero).
+        currentPhase = `audio_probe:${String(phase || 'init')}`;
         if (audioPlan.mode === 'file' && audioPlan.audioFile) {
           const audio = await ensureAudioFromFile(page, { audioFile: audioPlan.audioFile, waitMs: 1200, requireSignal: true });
           if (!audio.ok) {
@@ -1681,6 +1724,7 @@ async function main() {
         }
 
         try {
+          currentPhase = `webgl_probe:${String(phase || 'init')}`;
           const glInfo = await page.evaluate(() => {
             try {
               const c = document.createElement('canvas');
@@ -1958,6 +2002,7 @@ async function main() {
       await bootstrapWithRetries('init');
 
       // P1.2A: 标记采样循环开始时间
+      currentPhase = 'sampling';
       if (!timingStats.sampleLoopStartIso) {
         timingStats.sampleLoopStartIso = new Date().toISOString();
         meta.timing = { ...timingStats };
@@ -2525,16 +2570,29 @@ async function main() {
       const lastUrl = (() => {
         try { return page?.url?.() || null; } catch { return null; }
       })();
+      const lastPreflight = timingStats.preflightResults?.length
+        ? timingStats.preflightResults[timingStats.preflightResults.length - 1]
+        : null;
       meta.finishedAt = new Date().toISOString();
       meta.timing = { ...timingStats, elapsedSec: (Date.now() - startMs) / 1000 };
       meta.error = {
         code,
         pack,
         iter,
+        phase: currentPhase,
         message: String(error?.message || error || '').slice(0, 4000),
         stack: String(error?.stack || '').slice(0, 4000),
         lastUrl,
+        lastPreflight,
       };
+      // Dump page events buffer on fatal error
+      try {
+        if (pageEventsBuffer.length > 0) {
+          const eventsPath = path.join(outDir, `playwright-events-fatal.log`);
+          const eventsText = pageEventsBuffer.map((e) => `${e.ts} [${e.type}] ${e.text}`).join('\n');
+          await fsp.writeFile(eventsPath, eventsText + '\n', 'utf8');
+        }
+      } catch { /* ignore */ }
       await fsp.writeFile(metaPath, `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
     } catch {
       // ignore

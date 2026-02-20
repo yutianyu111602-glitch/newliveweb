@@ -38,7 +38,9 @@ param(
   [string]$VerifyPack = "ai_generated_coupled_final",
   [int]$HardTimeoutMs = 900000,
   [switch]$SkipVerify,
-  [switch]$CleanupStale
+  [switch]$CleanupStale,
+  [switch]$DryRun,
+  [switch]$EvalOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,6 +63,16 @@ $cleanupScript = Join-Path $projectRoot "scripts\\kill-stale-headless-browsers.p
 
 if (!(Test-Path $trainer)) { throw "Missing trainer: $trainer" }
 if (!(Test-Path $evalScript)) { throw "Missing eval script: $evalScript" }
+
+# P0: Git worktree guard — warn if unexpected files are dirty
+try {
+  $guardScript = Join-Path $PSScriptRoot "guard-git-status.ps1"
+  if (Test-Path $guardScript) {
+    & $guardScript
+  }
+} catch {
+  Write-Host "[overnight] WARNING: git guard check failed: $_" -ForegroundColor Yellow
+}
 
 Write-Host "[overnight] projectRoot=$projectRoot"
 Write-Host "[overnight] packs=$($packsList -join ',')"
@@ -125,8 +137,41 @@ if ($isCoupledFinalOnly) {
   }
   Write-Host "[eval] v4 env: manifest=$($env:COUPLED_SMOKE_PAIRS_MANIFEST) motionMin=$($env:COUPLED_SMOKE_MOTION_MIN) lumaMin=$($env:COUPLED_SMOKE_LUMA_MIN)"
 } else {
-  Write-Host "[eval] multi-pack or non-coupled-final → skipping v4 env injection (packs=$($packsList -join ','))"
+  Write-Host "[eval] multi-pack or non-coupled-final → skipping v4 env injection (packs=$($packsList -join ','))"  if (!$DryRun -and $packsList.Count -gt 1) {
+    Write-Host "[eval] NOTE: multi-pack mode uses default pairs-manifest.v0.json. Pass -PairsManifest env to override." -ForegroundColor Yellow
+  }
 }
+
+# --- DryRun: print plan and exit ---
+if ($DryRun) {
+  Write-Host ""
+  Write-Host "========== DRY RUN PLAN ==========" -ForegroundColor Cyan
+  Write-Host "  stamp:            $stamp"
+  Write-Host "  packs:            $($packsList -join ',')"
+  Write-Host "  outDir:           $outDir"
+  Write-Host "  isCoupledFinal:   $isCoupledFinalOnly"
+  Write-Host "  v4 env injected:  $isCoupledFinalOnly"
+  Write-Host "  manifest:         $(if ($env:COUPLED_SMOKE_PAIRS_MANIFEST) { $env:COUPLED_SMOKE_PAIRS_MANIFEST } else { 'pairs-manifest.v0.json' })"
+  Write-Host "  motionMin:        $(if ($env:COUPLED_SMOKE_MOTION_MIN) { $env:COUPLED_SMOKE_MOTION_MIN } else { 'default' })"
+  Write-Host "  lumaMin:          $(if ($env:COUPLED_SMOKE_LUMA_MIN) { $env:COUPLED_SMOKE_LUMA_MIN } else { 'default' })"
+  Write-Host "  targetCoverage:   $TargetCoverage"
+  Write-Host "  maxHours:         $MaxHours"
+  Write-Host "  gpuMode:          $GpuMode"
+  Write-Host "  headed:           $Headed"
+  Write-Host "  evalPickMode:     $EvalPickMode"
+  Write-Host "  trainer:          $trainer"
+  Write-Host "  epochs:           $Epochs"
+  Write-Host "  skipVerify:       $SkipVerify"
+  Write-Host "  evalOnly:         $EvalOnly"
+  Write-Host "  verifyPack:       $VerifyPack"
+  foreach ($pack in $packsList) {
+    $pm = Join-Path $projectRoot ("public\\presets\\{0}\\pairs-manifest.v0.json" -f $pack)
+    $exists = Test-Path $pm
+    Write-Host "  manifest[$pack]:  $pm (exists=$exists)"
+  }
+  Write-Host "===================================" -ForegroundColor Cyan
+  Write-Host "[overnight] DryRun complete — no eval/train/verify executed."
+  exit 0}
 
 Push-Location $projectRoot
 try {
@@ -259,6 +304,13 @@ if ($okRate -lt 0.10) {
   exit 1
 }
 Write-Host "[overnight] GATE PASSED: okRate=$okRate" -ForegroundColor Green
+
+# --- EvalOnly: stop after eval + gate ---
+if ($EvalOnly) {
+  Write-Host "[overnight] EvalOnly mode \u2014 skipping training and verify."
+  Write-Host "[overnight] run-summary.json: $summaryPath"
+  exit 0
+}
 
 $scoreManifests = @()
 foreach ($pack in $packsList) {

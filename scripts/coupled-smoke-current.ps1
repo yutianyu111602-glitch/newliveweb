@@ -111,3 +111,44 @@ if ($attempt1 -ne 0) {
 }
 
 Write-Host "[smoke] PASS" -ForegroundColor Green
+
+# --- Fixed summary block (copy-paste friendly) ---
+$finalRelease = Get-ChildItem "$PSScriptRoot\..\artifacts\_release_*" -Directory -ErrorAction SilentlyContinue |
+  Sort-Object Name -Descending | Select-Object -First 1
+if ($finalRelease) {
+  $fMeta = $null
+  $fMetaPath = Join-Path $finalRelease.FullName "meta.json"
+  if (Test-Path $fMetaPath) {
+    try { $fMeta = Get-Content $fMetaPath -Raw | ConvertFrom-Json } catch {}
+  }
+  $fCode     = if ($fMeta -and $fMeta.error) { $fMeta.error.code } else { "none" }
+  $fRenderer = if ($fMeta -and $fMeta.runtime -and $fMeta.runtime.webgl) { $fMeta.runtime.webgl.renderer } else { "unknown" }
+  $fNavTO    = if ($fMeta -and $fMeta.timing) { $fMeta.timing.navTimeoutCount } else { 0 }
+  $fRestart  = if ($fMeta -and $fMeta.timing) { $fMeta.timing.browserRestartCount } else { 0 }
+  $fElapsed  = if ($fMeta -and $fMeta.timing -and $fMeta.timing.elapsedSec) { [Math]::Round($fMeta.timing.elapsedSec, 1) } else { "?" }
+  # Count eval lines
+  $fEvalPath = Join-Path $finalRelease.FullName "eval.jsonl"
+  $fSamples  = 0
+  $fOkCount  = 0
+  if (Test-Path $fEvalPath) {
+    $evalLines = Get-Content $fEvalPath -ErrorAction SilentlyContinue | Where-Object { $_ -match "^\{" }
+    $fSamples = $evalLines.Count
+    foreach ($line in $evalLines) {
+      try { $obj = $line | ConvertFrom-Json; if ($obj.okHeuristic -eq $true) { $fOkCount++ } } catch {}
+    }
+  }
+  $fOkRate = if ($fSamples -gt 0) { [Math]::Round($fOkCount / $fSamples, 3) } else { 0 }
+  Write-Host ""
+  Write-Host "========== SMOKE SUMMARY ==========" -ForegroundColor Cyan
+  Write-Host "  result:           PASS"
+  Write-Host "  error.code:       $fCode"
+  Write-Host "  vitePort:         5174"
+  Write-Host "  host:             $ViteHost"
+  Write-Host "  webgl.renderer:   $fRenderer"
+  Write-Host "  samples:          $fSamples (okRate=$fOkRate)"
+  Write-Host "  navTimeoutCount:  $fNavTO"
+  Write-Host "  browserRestarts:  $fRestart"
+  Write-Host "  elapsed:          ${fElapsed}s"
+  Write-Host "  evidenceDir:      $($finalRelease.FullName)"
+  Write-Host "===================================" -ForegroundColor Cyan
+}

@@ -1,6 +1,6 @@
 # newliveweb MASTER_SPEC（SSOT）
 
-> 本文档是全项目唯一真相源（SSOT）。  
+> 本文档是全项目唯一真相源（SSOT）。
 > 任何"跑法/命令/路径/门禁规则"不得在其他文档复制粘贴，只能链接到本文对应章节。
 
 ## 0. 读者导航
@@ -30,28 +30,28 @@
 
 **文档类型（必须在文档头部显式标记其角色）**：
 
-- **SSOT / Canonical（执行权威）**  
+- **SSOT / Canonical（执行权威）**
   - 唯一执行权威：`docs/MASTER_SPEC.zh.md`（本文件）
   - 任何脚本跑法、门禁口径、数量口径、排障入口，最终都必须能回链到 SSOT
 
-- **Plan（计划入口）**  
+- **Plan（计划入口）**
   - 唯一计划入口：`docs/PLAN_CURRENT.md`
   - 其它计划类文档若存在，只能作为历史记录/草案，必须标记为非当前入口
 
-- **Runbook（可执行操作手册）**  
+- **Runbook（可执行操作手册）**
   - 允许包含命令，但必须满足"硬规则 1.3"：命令后必须附 SSOT 链接（指向门禁/跑法的权威段落）
   - 允许记录"当时有效"的步骤，但需要明确版本/日期/适用范围
 
-- **Report / Audit（事实记录与证据）**  
+- **Report / Audit（事实记录与证据）**
   - 允许保留当时观察与结论，但若出现规模/数字/口径，必须以 SSOT 的"产物口径"对齐
   - 与 SSOT 不一致必须显式标 `CONFLICT`（见 3.4.2 / 8.6）
 
-- **Whitepaper（技术参考，不是执行权威）**  
+- **Whitepaper（技术参考，不是执行权威）**
   - 必须显式声明：**Reference, not execution authority**
   - 禁止把 whitepaper 作为"唯一跑法/最终口径"的引用目标；whitepaper 内的命令必须回链 SSOT
 
 **whitepaper 分层权威模式（建议结构）**：
-- Overview → Pipeline → Dual → 3D → Perf  
+- Overview → Pipeline → Dual → 3D → Perf
 - 每一层都要写清：用途、适用范围、与 SSOT 的关系（引用/解释/背景，而非替代）
 
 **禁止项（Hard Ban）**：
@@ -118,9 +118,9 @@ npm run dev
 ### 3.4 Source Library SSOT（炼丹产物域）
 
 **口径定义（强制）**：
-- **Source Library（原矿/源库 SSOT）**：只读、可复用、不可凭记忆改数字  
+- **Source Library（原矿/源库 SSOT）**：只读、可复用、不可凭记忆改数字
   - 例：`C:\Users\pc\code\MilkDrop 130k+ Presets MegaPack 2025`（原矿）
-- **Training Cache（可重建缓存）**：允许生成/丢弃/重建，但禁止递归扫描  
+- **Training Cache（可重建缓存）**：允许生成/丢弃/重建，但禁止递归扫描
   - 例：`D:\aidata`（炼丹域）——任何统计以"明确文件路径 + 门禁脚本证据"为准
 
 **规模/数量口径（唯一可信来源）**：
@@ -308,25 +308,35 @@ node scripts/check-gpu.mjs
 ### 5.4 v4 hardened 默认参数（2026-02-19 固化）
 
 > Tag: `coupled-v4-hardened-20260219` (commit `ece8020`)
+> Port auto: commit `72fda38` — `--vitePort auto` + `--requireGpu` + multi-pack guard
 
 **默认 coupled 运行参数**：
 
-| 参数 | 值 |
-|------|-----|
-| `coupledPack` | `ai_generated_coupled_final` |
-| `coupledManifest` | `pairs-manifest.filtered.current.json` |
-| `motionMin` | `1e-5` |
-| `lumaMin` | `0.06` |
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `coupledPack` | `ai_generated_coupled_final` | |
+| `coupledManifest` | `pairs-manifest.filtered.current.json` | |
+| `motionMin` | `1e-5` | |
+| `lumaMin` | `0.06` | |
+| `vitePort` | `auto` | 自动探测空闲端口 5174→5224，消除并发冲突 |
+| `requireGpu` | 隐含 `headed && gpuMode!='off'` | SwiftShader 触发 `FATAL_WEBGL_SWIFTSHADER` 立即退出 |
 
-**强制门禁**：`MANIFEST_MISMATCH` fail-fast（pair 不在 manifest → 立即抛错退出）
+**强制门禁**：
+- `MANIFEST_MISMATCH` fail-fast（pair 不在 manifest → 立即抛错退出）
+- `FATAL_WEBGL_SWIFTSHADER` fail-fast（headed+GPU 时检测到 SwiftShader → 写入 `meta.error.code` 并退出）
 
 **入口脚本**：
 
-| 用途 | 脚本 |
-|------|------|
-| 复验/smoke | `scripts/coupled-smoke-current.ps1` |
-| 负测（证明 fail-fast 有效） | `scripts/coupled-negative-manifest-mismatch.ps1` |
-| verify-dev（底层） | `scripts/verify-dev-coupled.ps1` |
+| 用途 | 脚本 | npm 入口 |
+|------|------|----------|
+| 复验/smoke | `scripts/coupled-smoke-current.ps1` | `npm run coupled:smoke:current` |
+| 负测（证明 fail-fast 有效） | `scripts/coupled-negative-manifest-mismatch.ps1` | `npm run coupled:test:manifest-mismatch` |
+| verify-dev（底层） | `scripts/verify-dev-coupled.ps1` | — |
+| 强制 stage filtered.current | `scripts/git-stage-coupled-current.ps1` | — |
+
+**npm 兼容性**：`pwsh || powershell` 双链路，PS5/PS7 均可运行。
+
+**multi-pack 防护**：过夜脚本仅在单包 `ai_generated_coupled_final` 时注入 v4 env；多包或其他包自动跳过。
 
 **v4 基准结果**（360 samples, `pairs-manifest.filtered.v4.json`, 31/3000 pairs）：
 
@@ -336,7 +346,17 @@ node scripts/check-gpu.mjs
 | too-dark | **0.431** | ≤ 0.45 |
 | low-motion | **0.286** | ≤ 0.55 |
 
-**夜跑接入**：在过夜脚本调用 coupled eval 前设置环境变量：
+**meta.json 证据字段**：
+
+| 字段 | 说明 |
+|------|------|
+| `vitePort` | 实际使用的端口号 |
+| `vitePortMode` | `auto` 或 `fixed` |
+| `runtime.requireGpu` | 是否启用 GPU 门禁 |
+| `runtime.webgl.renderer` | WebGL 渲染器名称 |
+| `meta.error.code` | 失败分类码（`FATAL_WEBGL_SWIFTSHADER` / `MANIFEST_MISMATCH`） |
+
+**夜跑接入**：过夜脚本自动注入（单包 `ai_generated_coupled_final` 时）：
 
 ```powershell
 $env:COUPLED_SMOKE_PAIRS_MANIFEST = "pairs-manifest.filtered.current.json"
@@ -345,6 +365,55 @@ $env:COUPLED_SMOKE_LUMA_MIN       = "0.06"
 ```
 
 **迭代到 v5**：重新生成 keep list → 覆盖 `filtered.current.json` → 同一套 verify-dev + 负测。
+
+### 5.5 闭环运维：入口、证据、门禁（2026-02-20 固化）
+
+#### 唯一入口
+| 场景 | 命令 |
+|------|------|
+| 快速复验 | `npm run coupled:smoke:current` 或 `pwsh scripts/coupled-smoke-current.ps1` |
+| 夜跑（完整） | `pwsh scripts/run-coupled-quality-overnight.ps1 -Packs "ai_generated_coupled_final"` |
+| 夜跑（仅 eval + gate） | `pwsh scripts/run-coupled-quality-overnight.ps1 -EvalOnly` |
+| 夜跑（dry run） | `pwsh scripts/run-coupled-quality-overnight.ps1 -DryRun` |
+| manifest 切换 | `pwsh scripts/coupled-set-current.ps1 -Version v4` |
+| 强制 stage manifest | `pwsh scripts/git-stage-coupled-current.ps1` |
+| 连接诊断 | `pwsh scripts/diagnose-vite-connection.ps1 -Port 5174` |
+
+#### 失败证据文件（任何失败必产出）
+| 文件 | 位置 | 说明 |
+|------|------|------|
+| `meta.json` | `artifacts/coupled-eval/<stamp>/` | 含 `error.code`、`phase`、`lastUrl`、`lastPreflight` |
+| `eval.jsonl` | 同上 | 每条采样的质量判定 |
+| `vite.log` | 同上 | Vite + 导航 + preflight 日志 |
+| `run-summary.json` | 同上 | 夜跑产出，包含 inputs/env/outputs/failure/gate |
+| `nav_fail_tryN.png` | 同上 | 导航超时时的页面截图 |
+| `playwright-events-<pack>.log` | 同上 | 导航失败时的 pageerror/console/requestfailed 事件 |
+| `playwright-events-fatal.log` | 同上 | 致命错误时的全局事件 buffer |
+| `diagnostics.txt` | `artifacts/_release_<ts>/` | smoke 双失败时的连接诊断 |
+
+#### error.code 全量列表（SSOT）
+| error.code | 触发条件 | 自动处理 |
+|------------|----------|----------|
+| `FATAL_WEBGL_SWIFTSHADER` | headed 模式检测到 SwiftShader | 立即退出 |
+| `FATAL_MANIFEST_MISMATCH` | pair 不在 manifest | 立即退出 |
+| `FATAL_VITE_NOT_READY` | preflight HTTP 失败 | 切换 host 重试 |
+| `FATAL_PAGE_GOTO_TIMEOUT` | preflight ok 但 page.goto 超时 | 切换 host 重试 |
+| `FATAL_BROWSER_RESTART_LIMIT` | browser 重启超限 | 退出 |
+| `FATAL_NO_SAMPLES` | 0 条采样 | 退出 |
+| `FATAL_PLAYWRIGHT_CRASH` | browser/page 意外关闭 | 切换 host 重试 |
+| `FATAL_AUDIO` | 音频初始化失败 | 退出 |
+| `FATAL_NO_FREE_PORT` | 无可用端口 | 退出 |
+| `UNKNOWN` | 未分类错误 | 切换 host 重试 |
+
+#### overnight gate 规则
+- `okRate < 0.10` → 终止训练
+- `error.code` 为任何 `FATAL_*` → 终止训练
+- verify 失败 → 写入 run-summary.json 并透传 exit code
+
+#### manifest current 切换流程
+1. `pwsh scripts/coupled-set-current.ps1 -Version v4` — 复制 `pairs-manifest.filtered.v4.json` → `current.json` + 写 `current.stamp.json`
+2. `pwsh scripts/git-stage-coupled-current.ps1` — 校验 stamp 一致性 → force-add
+3. **禁止手动编辑** `pairs-manifest.filtered.current.json`
 
 ## 6. runtime 选择逻辑
 
@@ -409,7 +478,7 @@ rm -f artifacts/overnight/resume.json && npm run playbook:overnight
 - **呈现层**：最终喂给渲染与运行时的"单一输出对象"
 
 **单 writer 原则（Hard Rule）**：
-- 同一参数同一时刻只允许一个写入者  
+- 同一参数同一时刻只允许一个写入者
 - 最终输出必须从一个仲裁器/控制器生成，禁止分散写
 
 **仲裁优先级建议（可执行默认）**：
@@ -515,16 +584,16 @@ curl http://localhost:5173/api/diagnostics | jq '.audioRms'
 
 **常见现象 → 根因 → 动作**：
 
-- 现象：画面不跟音乐 / 宏被抢 / 参数"忽大忽小"  
-  - 根因：多源同时写（违反单 writer）或仲裁优先级错误  
+- 现象：画面不跟音乐 / 宏被抢 / 参数"忽大忽小"
+  - 根因：多源同时写（违反单 writer）或仲裁优先级错误
   - 动作：检查是否存在"多个 writer"；统一到仲裁器一次性输出；按 6.3 优先级修
 
-- 现象：Favorites 被污染（收藏变得随机/不可控）  
-  - 根因：runtime-only 层写回 slow state（违反快慢层隔离）  
+- 现象：Favorites 被污染（收藏变得随机/不可控）
+  - 根因：runtime-only 层写回 slow state（违反快慢层隔离）
   - 动作：禁止写回 `VisualStateV2/lastVisualState`；将随机点缀转为纯 runtime-only
 
-- 现象：HOLD/MIDI lock 失效  
-  - 根因：仲裁优先级未把 lock/hold 放在最高  
+- 现象：HOLD/MIDI lock 失效
+  - 根因：仲裁优先级未把 lock/hold 放在最高
   - 动作：优先级固定为 `midiLock > manualHold > merge(...)`
 
 ## 9. 变更记录
